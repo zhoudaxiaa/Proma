@@ -53,6 +53,8 @@ import { getMemoryConfig } from './memory-service'
 import { searchMemory, addMemory, formatSearchResult } from './memos-client'
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
+import { startClaudeOpenAiProxy, type ClaudeOpenAiProxyHandle } from './openai-claude-proxy/server'
+import { getClaudeApiFormat } from './openai-claude-proxy/transform'
 
 // ===== 类型定义 =====
 
@@ -559,10 +561,19 @@ export class AgentOrchestrator {
       sdkEnv.ANTHROPIC_BASE_URL = normalizeAnthropicBaseUrlForSdk(baseUrl)
     }
 
+    const isLocalProxyBaseUrl =
+      baseUrl?.startsWith('http://127.0.0.1:') ||
+      baseUrl?.startsWith('http://localhost:')
     const proxyUrl = await getEffectiveProxyUrl()
-    if (proxyUrl) {
+    if (proxyUrl && !isLocalProxyBaseUrl) {
       sdkEnv.HTTPS_PROXY = proxyUrl
       sdkEnv.HTTP_PROXY = proxyUrl
+    } else if (isLocalProxyBaseUrl) {
+      // SDK 请求本地协议转换代理时不能再走系统代理；上游代理由本地代理内部处理。
+      sdkEnv.HTTPS_PROXY = ''
+      sdkEnv.HTTP_PROXY = ''
+      sdkEnv.NO_PROXY = '127.0.0.1,localhost'
+      sdkEnv.no_proxy = '127.0.0.1,localhost'
     }
 
     // Windows 平台：配置 Shell 环境
@@ -1023,6 +1034,35 @@ export class AgentOrchestrator {
     }
 
     // 3. 构建环境变量
+    let openAiProxy: ClaudeOpenAiProxyHandle | undefined
+    let sdkBaseUrl = channel.baseUrl
+    const apiFormat = getClaudeApiFormat(channel.provider)
+    if (apiFormat !== 'anthropic') {
+      try {
+        const upstreamProxyUrl = await getEffectiveProxyUrl()
+        openAiProxy = await startClaudeOpenAiProxy({
+          provider: channel.provider,
+          apiKey,
+          upstreamBaseUrl: channel.baseUrl,
+          apiFormat,
+          proxyUrl: upstreamProxyUrl,
+        })
+        sdkBaseUrl = openAiProxy.baseUrl
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '未知错误'
+        console.error('[Agent 编排] 启动 OpenAI-Claude 代理失败:', error)
+        reportPreflightError({
+          code: 'unknown_error',
+          title: '协议适配代理启动失败',
+          message: `无法启动本地 OpenAI 协议适配代理：${message}`,
+          actions: [],
+          canRetry: true,
+        })
+        releaseActiveRun()
+        return
+      }
+    }
+
     // 同步凭证到 process.env（SDK in-process 代码可能直接读取 process.env）
     // 先清理再注入，确保 SDK 无论从 env 选项还是 process.env 都拿到正确值
     delete process.env.ANTHROPIC_API_KEY
@@ -1040,11 +1080,26 @@ export class AgentOrchestrator {
       process.env.ANTHROPIC_API_KEY = apiKey
     }
     // 使用与 buildSdkEnv 相同的规范化逻辑，确保 process.env 和 sdkEnv 中的 URL 一致
-    if (channel.baseUrl && channel.baseUrl !== 'https://api.anthropic.com') {
-      process.env.ANTHROPIC_BASE_URL = normalizeAnthropicBaseUrlForSdk(channel.baseUrl)
+    if (sdkBaseUrl && sdkBaseUrl !== 'https://api.anthropic.com') {
+      process.env.ANTHROPIC_BASE_URL = normalizeAnthropicBaseUrlForSdk(sdkBaseUrl)
     }
 
-    const sdkEnv = await this.buildSdkEnv(apiKey, channel.baseUrl, channel.provider)
+    let sdkEnv: Record<string, string | undefined>
+    try {
+      sdkEnv = await this.buildSdkEnv(apiKey, sdkBaseUrl, channel.provider)
+    } catch (error) {
+      await openAiProxy?.close()
+      const message = error instanceof Error ? error.message : '未知错误'
+      reportPreflightError({
+        code: 'unknown_error',
+        title: 'Agent 环境初始化失败',
+        message,
+        actions: [],
+        canRetry: true,
+      })
+      releaseActiveRun()
+      return
+    }
 
     // 4. 读取已有的 SDK session ID（用于 resume）
     const sessionMeta = getAgentSessionMeta(sessionId)
@@ -2053,6 +2108,7 @@ export class AgentOrchestrator {
       }
 
     } finally {
+      await openAiProxy?.close()
       // 只在 generation 匹配时才清理，防止旧流的 finally 误删新流的注册
       releaseActiveRun()
       permissionService.clearSessionPending(sessionId)

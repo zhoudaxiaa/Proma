@@ -3,7 +3,7 @@
  *
  * 分为两个区块：
  * 1. 渠道管理 — 所有渠道列表 + 添加/编辑/删除（渠道同时用于 Chat 和 Agent）
- * 2. Agent 供应商 — 从已启用的 Anthropic 兼容渠道（Anthropic / DeepSeek / Kimi / MiniMax）中
+ * 2. Agent 供应商 — 从已启用的 Agent 兼容渠道中
  *    通过 Switch 开关启用多个 Agent 供应商
  */
 
@@ -80,11 +80,45 @@ export function ChannelSettings(): React.ReactElement {
     const currentIds = agentChannelIdsRef.current
 
     if (eligible) {
-      if (currentIds.includes(channel.id)) return
+      let readyChannel = channel
+      let firstModel = readyChannel.models.find((model) => model.enabled)
+      if (!firstModel && readyChannel.models.length > 0) {
+        const firstModelId = readyChannel.models[0]!.id
+        const models = readyChannel.models.map((model) =>
+          model.id === firstModelId ? { ...model, enabled: true } : model
+        )
+        readyChannel = await window.electronAPI.updateChannel(channel.id, { models })
+        firstModel = readyChannel.models.find((model) => model.enabled)
+      }
+
+      if (currentIds.includes(channel.id)) {
+        if (!agentChannelIdRef.current) {
+          agentChannelIdRef.current = readyChannel.id
+          setAgentChannelId(readyChannel.id)
+          if (firstModel) setAgentModelId(firstModel.id)
+          await window.electronAPI.updateSettings({
+            agentChannelId: readyChannel.id,
+            ...(firstModel && { agentModelId: firstModel.id }),
+          }).catch(console.error)
+        }
+        return
+      }
       const newIds = [...currentIds, channel.id]
       agentChannelIdsRef.current = newIds
       setAgentChannelIds(newIds)
-      await window.electronAPI.updateSettings({ agentChannelIds: newIds }).catch(console.error)
+      const updates: Parameters<typeof window.electronAPI.updateSettings>[0] = {
+        agentChannelIds: newIds,
+      }
+      if (!agentChannelIdRef.current) {
+        agentChannelIdRef.current = readyChannel.id
+        setAgentChannelId(readyChannel.id)
+        updates.agentChannelId = readyChannel.id
+        if (firstModel) {
+          setAgentModelId(firstModel.id)
+          updates.agentModelId = firstModel.id
+        }
+      }
+      await window.electronAPI.updateSettings(updates).catch(console.error)
       return
     }
 
@@ -157,9 +191,24 @@ export function ChannelSettings(): React.ReactElement {
   }
 
   /** 切换 Agent 供应商开关 */
-  const handleToggleAgentProvider = async (channelId: string, enabled: boolean): Promise<void> => {
+  const handleToggleAgentProvider = async (channel: Channel, enabled: boolean): Promise<void> => {
+    const channelId = channel.id
+    let readyChannel = channel
+    let firstModel = readyChannel.models.find((model) => model.enabled)
+
+    // OpenAI 兼容渠道从接口拉取的新模型默认不勾选。启用 Agent 供应商时，
+    // 若已有模型但全部未启用，自动启用第一个模型，避免 Agent 输入区显示"暂无可用模型"。
+    if (enabled && !firstModel && readyChannel.models.length > 0) {
+      const firstModelId = readyChannel.models[0]!.id
+      const models = readyChannel.models.map((model) =>
+        model.id === firstModelId ? { ...model, enabled: true } : model
+      )
+      readyChannel = await window.electronAPI.updateChannel(channelId, { models })
+      firstModel = readyChannel.models.find((model) => model.enabled)
+    }
+
     const newIds = enabled
-      ? [...agentChannelIds, channelId]
+      ? Array.from(new Set([...agentChannelIds, channelId]))
       : agentChannelIds.filter((id) => id !== channelId)
 
     setAgentChannelIds(newIds)
@@ -176,7 +225,20 @@ export function ChannelSettings(): React.ReactElement {
       return
     }
 
+    if (enabled && !agentChannelId) {
+      setAgentChannelId(channelId)
+      if (firstModel) setAgentModelId(firstModel.id)
+      await window.electronAPI.updateSettings({
+        agentChannelIds: newIds,
+        agentChannelId: channelId,
+        ...(firstModel && { agentModelId: firstModel.id }),
+      }).catch(console.error)
+      await loadChannels()
+      return
+    }
+
     await window.electronAPI.updateSettings({ agentChannelIds: newIds }).catch(console.error)
+    await loadChannels()
   }
 
   /** 表单保存回调 */
@@ -215,7 +277,7 @@ export function ChannelSettings(): React.ReactElement {
       {/* 区块一：模型配置 */}
       <SettingsSection
         title="模型配置"
-        description="管理 AI 供应商连接，配置 API Key 和可用模型。Anthropic 渠道同时可用于 Agent 模式"
+        description="管理 AI 供应商连接，配置 API Key 和可用模型。Anthropic 与 OpenAI 兼容渠道可用于 Agent 模式"
         action={
           <Button size="sm" onClick={() => setViewMode('create')}>
             <Plus size={16} />
@@ -265,7 +327,7 @@ export function ChannelSettings(): React.ReactElement {
         ) : agentCapableChannels.length === 0 ? (
           <SettingsCard divided={false}>
             <div className="text-sm text-muted-foreground py-8 text-center">
-              暂无可用的 Anthropic 兼容渠道，请先在上方添加 Anthropic / DeepSeek / Kimi / MiniMax 渠道并启用
+              暂无可用的 Agent 渠道，请先在上方添加 Anthropic 或 OpenAI 兼容渠道并启用
             </div>
           </SettingsCard>
         ) : (
@@ -275,7 +337,7 @@ export function ChannelSettings(): React.ReactElement {
                 key={channel.id}
                 channel={channel}
                 enabled={agentChannelIds.includes(channel.id)}
-                onToggle={(enabled) => handleToggleAgentProvider(channel.id, enabled)}
+                onToggle={(enabled) => handleToggleAgentProvider(channel, enabled)}
               />
             ))}
           </SettingsCard>

@@ -174,6 +174,8 @@ function AgentSettingsInitializer(): null {
       setChannelsLoaded(true)
 
       const channelIds = new Set(channels.map((c) => c.id))
+      const hasValidAgentChannelId = Boolean(settings.agentChannelId && channelIds.has(settings.agentChannelId))
+      let resolvedAgentChannelId: string | null = null
 
       // 验证 Chat 模式的全局默认模型（localStorage 持久化的可能指向已删除渠道）
       const chatModel = store.get(selectedModelAtom)
@@ -183,40 +185,86 @@ function AgentSettingsInitializer(): null {
       }
 
       // 验证并加载 Agent 渠道/模型
-      if (settings.agentChannelId && channelIds.has(settings.agentChannelId)) {
+      if (hasValidAgentChannelId && settings.agentChannelId) {
+        resolvedAgentChannelId = settings.agentChannelId
         setAgentChannelId(settings.agentChannelId)
-      } else if (settings.agentChannelId && !channelIds.has(settings.agentChannelId)) {
+      } else if (settings.agentChannelId) {
         // 渠道已删除，清除无效设置
         console.warn('[AgentSettings] agentChannelId 指向已删除的渠道，清除')
         window.electronAPI.updateSettings({ agentChannelId: undefined, agentModelId: undefined }).catch(console.error)
       }
-      if (settings.agentModelId && (!settings.agentChannelId || channelIds.has(settings.agentChannelId))) {
+      if (settings.agentModelId && (!settings.agentChannelId || hasValidAgentChannelId)) {
         setAgentModelId(settings.agentModelId)
       }
 
       // 加载 Agent 启用渠道列表，过滤已删除的渠道
+      let validAgentChannelIds: string[] = []
       if (settings.agentChannelIds && settings.agentChannelIds.length > 0) {
-        const validIds = settings.agentChannelIds.filter((id) => channelIds.has(id))
-        setAgentChannelIds(validIds)
+        validAgentChannelIds = settings.agentChannelIds.filter((id) => channelIds.has(id))
+        setAgentChannelIds(validAgentChannelIds)
         // 如果有渠道被清理，持久化更新后的列表
-        if (validIds.length !== settings.agentChannelIds.length) {
+        if (validAgentChannelIds.length !== settings.agentChannelIds.length) {
           console.warn('[AgentSettings] 清理了已删除的 agentChannelIds')
-          window.electronAPI.updateSettings({ agentChannelIds: validIds }).catch(console.error)
+          window.electronAPI.updateSettings({ agentChannelIds: validAgentChannelIds }).catch(console.error)
         }
-      } else if (settings.agentChannelId && channelIds.has(settings.agentChannelId)) {
+      } else if (hasValidAgentChannelId && settings.agentChannelId) {
         // 迁移：旧版本只有 agentChannelId，自动转为数组
-        const migrated = [settings.agentChannelId]
-        setAgentChannelIds(migrated)
-        window.electronAPI.updateSettings({ agentChannelIds: migrated }).catch(console.error)
+        validAgentChannelIds = [settings.agentChannelId]
+        setAgentChannelIds(validAgentChannelIds)
+        window.electronAPI.updateSettings({ agentChannelIds: validAgentChannelIds }).catch(console.error)
       }
 
       // 兜底：agentChannelId 存在但不在 agentChannelIds 白名单中，自动修复不一致
-      if (settings.agentChannelId && channelIds.has(settings.agentChannelId)) {
+      if (hasValidAgentChannelId && settings.agentChannelId) {
         const currentIds = settings.agentChannelIds?.filter((id) => channelIds.has(id)) ?? []
         if (!currentIds.includes(settings.agentChannelId)) {
           const fixedIds = [...currentIds, settings.agentChannelId]
           setAgentChannelIds(fixedIds)
           window.electronAPI.updateSettings({ agentChannelIds: fixedIds }).catch(console.error)
+        }
+      }
+
+      // 兜底：只启用了 Agent 供应商列表但尚未设置默认供应商时，自动选第一个可用渠道。
+      if (!hasValidAgentChannelId && validAgentChannelIds.length > 0) {
+        const fallbackChannel = channels.find(
+          (channel) => validAgentChannelIds.includes(channel.id) && channel.enabled && channel.models.some((model) => model.enabled),
+        )
+        const fallbackModel = fallbackChannel?.models.find((model) => model.enabled)
+        if (fallbackChannel) {
+          resolvedAgentChannelId = fallbackChannel.id
+          setAgentChannelId(fallbackChannel.id)
+          if (fallbackModel) setAgentModelId(fallbackModel.id)
+          window.electronAPI.updateSettings({
+            agentChannelId: fallbackChannel.id,
+            ...(fallbackModel && { agentModelId: fallbackModel.id }),
+          }).catch(console.error)
+        }
+      }
+
+      // 兜底：OpenAI 兼容渠道的拉取模型默认不启用；若当前 Agent 渠道已有模型但全部未启用，
+      // 自动启用第一个模型，让 Agent 输入区不再停在"暂无可用模型"。
+      if (resolvedAgentChannelId) {
+        const selectedAgentChannel = channels.find(
+          (channel) => channel.id === resolvedAgentChannelId && channel.enabled,
+        )
+        if (
+          selectedAgentChannel &&
+          selectedAgentChannel.models.length > 0 &&
+          !selectedAgentChannel.models.some((model) => model.enabled)
+        ) {
+          const firstModel = selectedAgentChannel.models[0]!
+          const models = selectedAgentChannel.models.map((model) =>
+            model.id === firstModel.id ? { ...model, enabled: true } : model
+          )
+          window.electronAPI.updateChannel(selectedAgentChannel.id, { models })
+            .then((updatedChannel) => {
+              setChannels(channels.map((channel) =>
+                channel.id === updatedChannel.id ? updatedChannel : channel
+              ))
+              setAgentModelId(firstModel.id)
+              return window.electronAPI.updateSettings({ agentModelId: firstModel.id })
+            })
+            .catch(console.error)
         }
       }
 

@@ -58,15 +58,20 @@ export const PROVIDER_LABELS: Record<ProviderType, string> = {
 /**
  * 支持 Agent 模式的供应商类型
  *
- * Agent SDK 通过 Anthropic 兼容协议调用 `/v1/messages` 端点，
- * 因此所有 Anthropic 协议兼容的供应商都可以用于 Agent。
+ * Agent SDK 通过 Anthropic 兼容协议调用 `/v1/messages` 端点。
+ * Anthropic 兼容供应商可直接使用；OpenAI 兼容供应商由主进程本地适配代理转换协议。
  */
 export const AGENT_COMPATIBLE_PROVIDERS: ReadonlySet<ProviderType> = new Set<ProviderType>([
   'anthropic',
+  'openai',
   'deepseek',
   'kimi-api',
   'kimi-coding',
   'minimax',
+  'zhipu',
+  'doubao',
+  'qwen',
+  'custom',
 ])
 
 /**
