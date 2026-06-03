@@ -58,6 +58,8 @@ import type { NotificationSoundType } from '@/types/settings'
 import { toast } from 'sonner'
 import type { AgentStreamEvent, AgentStreamCompletePayload, AgentEvent, AgentStreamPayload, SDKAssistantMessage, SDKUserMessage, SDKSystemMessage, SDKContentBlock, SDKUserContentBlock, PromaEvent, AgentSessionMeta } from '@proma/shared'
 import { buildExternalAgentRunActivation } from '@/lib/external-agent-run'
+import { getAgentCompletionMarkers } from '@/lib/agent-completion-presence'
+import { getPlanModeChangeFromToolName, updatePlanModeSessionSet } from '@/lib/agent-plan-mode'
 
 /** 触发右侧文件浏览器自动定位的写入类工具集合 */
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Update'])
@@ -109,9 +111,18 @@ function inferContextWindow(model?: string): number | undefined {
   const m = model.toLowerCase()
   // Claude Haiku 为 200k
   if (m.includes('claude-haiku')) return 200_000
-  // Claude Sonnet 4+、Opus 4.6+、DeepSeek V4 系列均为 1M 上下文
-  if (m.includes('claude-sonnet-4-6') || m.includes('claude-opus-4-6') || m.includes('claude-opus-4-7')) return 1_000_000
+  // Claude Sonnet 4.6、Opus 4.6 / 4.7 / 4.8、DeepSeek V4 系列均为 1M 上下文
+  if (
+    m.includes('claude-sonnet-4-6') ||
+    m.includes('claude-opus-4-6') ||
+    m.includes('claude-opus-4-7') ||
+    m.includes('claude-opus-4-8')
+  ) return 1_000_000
   if (m.includes('deepseek-v4')) return 1_000_000
+  // MiniMax M3 为 1M 上下文
+  if (m.includes('minimax-m3')) return 1_000_000
+  // 小米 MiMo：v2.5 / v2.5-pro / v2-pro 为 1M（omni / flash 仍走默认 200k）
+  if (m.includes('mimo-v2.5') || m.includes('mimo-v2-pro')) return 1_000_000
   return 200_000
 }
 
@@ -133,6 +144,8 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
         return [{ type: 'exit_plan_mode_resolved', requestId: evt.requestId }]
       case 'enter_plan_mode':
         return [{ type: 'enter_plan_mode', sessionId: evt.sessionId }]
+      case 'plan_mode_changed':
+        return [{ type: 'plan_mode_changed', active: evt.active, source: evt.source }]
       case 'model_resolved':
         return [{ type: 'model_resolved', model: evt.model }]
       case 'permission_mode_changed':
@@ -177,6 +190,14 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
           const tb = block as SDKContentBlock & { id: string; name: string; input: Record<string, unknown> }
           const intent = (tb.input._intent as string | undefined)
             ?? (tb.name === 'Bash' ? (tb.input.description as string | undefined) : undefined)
+          const planModeChange = getPlanModeChangeFromToolName(tb.name)
+          if (planModeChange) {
+            events.push({
+              type: 'plan_mode_changed',
+              active: planModeChange.active,
+              source: planModeChange.source,
+            })
+          }
           events.push({
             type: 'tool_start',
             toolName: tb.name,
@@ -284,6 +305,13 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
           } : undefined,
         }]
       }
+      if (sMsg.subtype === 'thinking_tokens' && typeof sMsg.estimated_tokens === 'number') {
+        return [{
+          type: 'thinking_tokens',
+          estimatedTokens: sMsg.estimated_tokens,
+          estimatedTokensDelta: typeof sMsg.estimated_tokens_delta === 'number' ? sMsg.estimated_tokens_delta : 0,
+        }]
+      }
       return []
     }
 
@@ -357,15 +385,12 @@ export function useGlobalAgentListeners(): void {
           currentStreamState: store.get(agentStreamingStatesAtom).get(event.sessionId),
         })
 
+        // 外部来源（飞书/钉钉/微信/bridge）唤起的 run 不抢占前台：
+        // 不打开新 Tab、不切换激活 Tab、不切换 appMode/当前会话/当前工作区。
+        // 只更新驱动左侧边栏列表与状态指示条所需的状态，让用户自行决定是否切过去。
+        // 若该会话恰好是用户当前正在查看的会话，这里不动 Tab/激活，流式内容会通过
+        // agentStreamingStatesAtom 自然刷新，用户视角无任何跳动。
         store.set(agentSessionsAtom, sessions)
-        store.set(tabsAtom, activation.tabs)
-        store.set(activeTabIdAtom, activation.activeTabId)
-        store.set(appModeAtom, 'agent')
-        store.set(currentAgentSessionIdAtom, event.sessionId)
-        if (activation.workspaceId) {
-          store.set(currentAgentWorkspaceIdAtom, activation.workspaceId)
-          window.electronAPI.updateSettings({ agentWorkspaceId: activation.workspaceId }).catch(console.error)
-        }
         const activationModelId = activation.modelId
         if (activationModelId) {
           store.set(agentSessionModelMapAtom, (prev) => {
@@ -580,6 +605,8 @@ export function useGlobalAgentListeners(): void {
           // 它通过下方 legacyEvents 分支写入 agentPromptSuggestionsAtom，显示在输入框上方
           if (msgRecord.type === 'prompt_suggestion') {
             // 跳过写入 liveMessages
+          } else if (msgRecord.type === 'system' && msgRecord.subtype === 'thinking_tokens') {
+            // thinking_tokens 是高频进度估算，只更新流式状态，不进入消息转录。
           } else if (!msgRecord.isReplay) {
             // 为实时消息补充 _createdAt 时间戳（与持久化时的逻辑一致），
             // 避免 AssistantTurnRenderer 因缺少时间戳导致 header 时间消失
@@ -849,18 +876,14 @@ export function useGlobalAgentListeners(): void {
             )
           } else if (event.type === 'enter_plan_mode') {
             // 进入 Plan 模式
-            store.set(agentPlanModeSessionsAtom, (prev: Set<string>) => {
-              if (prev.has(sessionId)) return prev
-              const next = new Set(prev)
-              next.add(sessionId)
-              return next
-            })
-            // 同步更新权限模式选择器（per-session）
-            store.set(agentPermissionModeMapAtom, (prev: Map<string, import('@proma/shared').PromaPermissionMode>) => {
-              const next = new Map(prev)
-              next.set(sessionId, 'plan')
-              return next
-            })
+            store.set(agentPlanModeSessionsAtom, (prev: Set<string>) =>
+              updatePlanModeSessionSet(prev, sessionId, true)
+            )
+          } else if (event.type === 'plan_mode_changed') {
+            // 计划阶段变化只影响输入框/横幅状态，不改用户选择的权限模式
+            store.set(agentPlanModeSessionsAtom, (prev: Set<string>) =>
+              updatePlanModeSessionSet(prev, sessionId, event.active)
+            )
           } else if (event.type === 'permission_mode_changed') {
             // 权限模式变更（如 Plan 模式退出后切换到自动审批或完全自动）
             console.log(`[GlobalAgentListeners] 权限模式变更: ${event.mode}`)
@@ -869,6 +892,9 @@ export function useGlobalAgentListeners(): void {
               next.set(sessionId, event.mode)
               return next
             })
+            store.set(agentPlanModeSessionsAtom, (prev: Set<string>) =>
+              updatePlanModeSessionSet(prev, sessionId, event.mode === 'plan')
+            )
           }
         }
         }) // unstable_batchedUpdates
@@ -918,10 +944,17 @@ export function useGlobalAgentListeners(): void {
           return map
         })
 
-        // 如果用户当前不在查看该会话，标记为"未查看的已完成"
+        // 当前激活会话完成后仍保留在 Working Done，等待用户用对勾明确确认。
+        // 只有未激活会话才进入"未查看完成"，避免当前页面完成时出现额外未读提醒。
         const currentSessionId = store.get(currentAgentSessionIdAtom)
-        const isViewingCompletedSession = data.sessionId === currentSessionId && document.hasFocus()
-        if (!isViewingCompletedSession) {
+        const completionMarkers = getAgentCompletionMarkers({
+          tabs: store.get(tabsAtom),
+          activeTabId: store.get(activeTabIdAtom),
+          currentAgentSessionId: currentSessionId,
+          sessionId: data.sessionId,
+          documentHasFocus: document.hasFocus(),
+        })
+        if (completionMarkers.markUnviewedCompleted) {
           store.set(unviewedCompletedSessionIdsAtom, (prev: Set<string>) => {
             const next = new Set(prev)
             next.add(data.sessionId)
@@ -929,12 +962,13 @@ export function useGlobalAgentListeners(): void {
           })
         }
 
-        // 添加到 Working Done 集合（保持到 Tab 关闭）
-        store.set(workingDoneSessionIdsAtom, (prev: Set<string>) => {
-          const next = new Set(prev)
-          next.add(data.sessionId)
-          return next
-        })
+        if (completionMarkers.keepInWorkingDone) {
+          store.set(workingDoneSessionIdsAtom, (prev: Set<string>) => {
+            const next = new Set(prev)
+            next.add(data.sessionId)
+            return next
+          })
+        }
 
         // 标记用户主动打断状态
         if (data.stoppedByUser) {

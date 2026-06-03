@@ -110,7 +110,7 @@ import type {
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/runtime-init'
-import { getUnstagedChanges, getFileDiff, getUntrackedContent, revertFile, getDiffContents } from './lib/git-diff-service'
+import { getUnstagedChanges, getFileDiff, getUntrackedContent, revertFile, getDiffContents, listWorktrees, getWorktreeChanges } from './lib/git-diff-service'
 import { registerPromaFilePath } from './lib/local-file-protocol'
 import { registerUpdaterIpc } from './lib/updater/updater-ipc'
 import {
@@ -169,6 +169,7 @@ import {
   moveSessionToWorkspace,
   forkAgentSession,
   autoArchiveAgentSessions,
+  cleanupStaleAttachedPaths,
   searchAgentSessionMessages,
   searchAgentSessionReferences,
 } from './lib/agent-session-manager'
@@ -210,6 +211,10 @@ import {
   attachWorkspaceFile,
   detachWorkspaceDirectory,
   detachWorkspaceFile,
+  getWorktreeRepos,
+  addWorktreeRepo,
+  removeWorktreeRepo,
+  cleanupStaleWorkspaceAttachedPaths,
 } from './lib/agent-workspace-manager'
 import { getMemoryConfig, setMemoryConfig } from './lib/memory-service'
 import { getAllToolInfos } from './lib/chat-tool-registry'
@@ -824,7 +829,31 @@ export function registerIpcHandlers(): void {
       }
       const access = normalizeFileAccessOptions({ sessionId })
       if (!ensurePathAllowed(dirPath, access) || (gitRoot && !ensurePathAllowed(gitRoot, access))) return null
-      return getDiffContents(dirPath, filePath, gitRoot)
+      return getDiffContents(dirPath, filePath, gitRoot, input.baseRef)
+    }
+  )
+
+  // 列出 Git Worktree（只读取 worktree 元信息，不涉及文件内容，跳过路径安全检查）
+  ipcMain.handle(
+    IPC_CHANNELS.LIST_WORKTREES,
+    async (_, repoPath: string, _sessionId: string) => {
+      if (!repoPath || typeof repoPath !== 'string') return []
+      return await listWorktrees(repoPath)
+    }
+  )
+
+  // 获取 Worktree 相对于基准分支的全量变更
+  ipcMain.handle(
+    IPC_CHANNELS.GET_WORKTREE_CHANGES,
+    async (_, worktreePath: string, baseBranch: string, sessionId: string) => {
+      if (!worktreePath || typeof worktreePath !== 'string') {
+        return { isGitRepo: false, files: [], untrackedFiles: [], gitRootNames: [] }
+      }
+      const access = normalizeFileAccessOptions({ sessionId })
+      if (!ensurePathAllowed(worktreePath, access)) {
+        return { isGitRepo: false, files: [], untrackedFiles: [], gitRootNames: [] }
+      }
+      return getWorktreeChanges(worktreePath, baseBranch)
     }
   )
 
@@ -931,11 +960,16 @@ export function registerIpcHandlers(): void {
   // 查询某个文件在本机的默认打开应用信息（带图标）
   ipcMain.handle(
     IPC_CHANNELS.GET_DEFAULT_APP_FOR_FILE,
-    async (_, filePath: string): Promise<import('@proma/shared').DefaultAppInfo | null> => {
+    async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<import('@proma/shared').DefaultAppInfo | null> => {
       if (!filePath || typeof filePath !== 'string') return null
       try {
+        const options = normalizeFileAccessOptions(access)
+        if (options && !isPathAllowed(filePath, options)) {
+          console.warn('[IPC] shell:get-default-app-for-file 拒绝越界路径:', filePath)
+          return null
+        }
         console.log('[IPC] get-default-app-for-file 收到请求:', filePath)
-        const result = await getDefaultAppInfoForFile(filePath)
+        const result = await getDefaultAppInfoForFile(filePath, options)
         console.log('[IPC] get-default-app-for-file 返回:', result ? `name=${result.name} appPath=${result.appPath} iconLen=${result.iconDataUrl?.length}` : 'null')
         return result
       } catch (err) {
@@ -1696,6 +1730,21 @@ export function registerIpcHandlers(): void {
       if (newManualWorking && current.archived) {
         updates.archived = false
       }
+      return updateAgentSessionMeta(id, updates)
+    }
+  )
+
+  // 确认 Agent 会话已完成（清除 completedButUnconfirmed 和 manualWorking）
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.CONFIRM_WORKING_DONE,
+    async (_, id: string): Promise<AgentSessionMeta> => {
+      const sessions = listAgentSessions()
+      const current = sessions.find((s) => s.id === id)
+      if (!current) throw new Error(`Agent session not found: ${id}`)
+      const updates: Partial<AgentSessionMeta> = {}
+      if (current.manualWorking) updates.manualWorking = false
+      if (current.completedButUnconfirmed) updates.completedButUnconfirmed = false
+      if (Object.keys(updates).length === 0) return current
       return updateAgentSessionMeta(id, updates)
     }
   )
@@ -2495,6 +2544,29 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.GET_WORKSPACE_ATTACHED_FILES,
     async (_, workspaceSlug: string): Promise<string[]> => {
       return getWorkspaceAttachedFiles(workspaceSlug)
+    }
+  )
+
+  // ===== Worktree 仓库配置管理 =====
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.GET_WORKTREE_REPOS,
+    async (_, workspaceSlug: string) => {
+      return getWorktreeRepos(workspaceSlug)
+    }
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.ADD_WORKTREE_REPO,
+    async (_, workspaceSlug: string, repo: import('@proma/shared').WorkspaceWorktreeRepo) => {
+      return addWorktreeRepo(workspaceSlug, repo)
+    }
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.REMOVE_WORKTREE_REPO,
+    async (_, workspaceSlug: string, repoPath: string) => {
+      return removeWorktreeRepo(workspaceSlug, repoPath)
     }
   )
 
@@ -3697,6 +3769,14 @@ export function registerIpcHandlers(): void {
 
   runAutoArchive()
   setInterval(runAutoArchive, 24 * 60 * 60 * 1000)
+
+  // 启动时清理不存在的附加目录/文件（如已删除的 worktree）
+  try {
+    cleanupStaleAttachedPaths()
+    cleanupStaleWorkspaceAttachedPaths()
+  } catch (error) {
+    console.error('[启动清理] 清理失效附加路径失败:', error)
+  }
 
   // ===== 存储管理 =====
 

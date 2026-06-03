@@ -247,6 +247,9 @@ export interface SDKResultMessage {
   total_cost_usd?: number
   modelUsage?: Record<string, { contextWindow?: number }>
   errors?: string[]
+  terminal_reason?: string
+  background_tasks?: SDKBackgroundTaskSummary[]
+  session_crons?: SDKSessionCronSummary[]
   session_id?: string
 }
 
@@ -273,6 +276,37 @@ export interface SDKSystemMessage {
   decision_reason?: string
   usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number }
   [key: string]: unknown
+}
+
+/** SDK thinking token 估算消息（Claude Agent SDK 0.3.156+） */
+export interface SDKThinkingTokensMessage {
+  type: 'system'
+  subtype: 'thinking_tokens'
+  estimated_tokens: number
+  estimated_tokens_delta: number
+  uuid?: string
+  session_id?: string
+}
+
+/** SDK 后台任务摘要（result / hook 中可能出现） */
+export interface SDKBackgroundTaskSummary {
+  id: string
+  type: string
+  status: string
+  description: string
+  command?: string
+  agent_type?: string
+  server?: string
+  tool?: string
+  name?: string
+}
+
+/** SDK 会话级定时任务摘要（result / hook 中可能出现） */
+export interface SDKSessionCronSummary {
+  id: string
+  schedule: string
+  recurring: boolean
+  prompt: string
 }
 
 /** SDK tool_progress 消息（工具执行心跳） */
@@ -307,6 +341,7 @@ export type SDKMessage =
   | SDKAssistantMessage
   | SDKUserMessage
   | SDKResultMessage
+  | SDKThinkingTokensMessage
   | SDKSystemMessage
   | SDKToolProgressMessage
   | SDKPromptSuggestionMessage
@@ -450,6 +485,9 @@ export interface AgentToolResultImage {
   mediaType: string
 }
 
+/** 计划阶段状态变化来源 */
+export type AgentPlanModeChangeSource = 'initial' | 'tool' | 'permission'
+
 /**
  * Agent 事件流类型
  *
@@ -467,6 +505,7 @@ export type AgentEvent =
   | { type: 'task_started'; taskId: string; toolUseId?: string; description: string; taskType?: string; turnId?: string }
   | { type: 'task_progress'; toolUseId: string; elapsedSeconds?: number; turnId?: string; taskId?: string; description?: string; lastToolName?: string; usage?: TaskUsage }
   | { type: 'task_notification'; taskId: string; toolUseId?: string; status: 'completed' | 'failed' | 'stopped'; summary: string; outputFile?: string; usage?: TaskUsage; turnId?: string }
+  | { type: 'thinking_tokens'; estimatedTokens: number; estimatedTokensDelta: number }
   | { type: 'shell_backgrounded'; toolUseId: string; shellId: string; intent?: string; command?: string; turnId?: string }
   | { type: 'shell_killed'; shellId: string; turnId?: string }
   // 工具使用摘要
@@ -496,6 +535,8 @@ export type AgentEvent =
   | { type: 'exit_plan_mode_resolved'; requestId: string }
   // EnterPlanMode 进入计划模式
   | { type: 'enter_plan_mode'; sessionId: string }
+  // 当前是否处于计划阶段（与用户选择的权限模式分离）
+  | { type: 'plan_mode_changed'; active: boolean; source: AgentPlanModeChangeSource }
   // 提示建议
   | { type: 'prompt_suggestion'; suggestion: string }
   // 模型确认（SDK 确认实际使用的模型）
@@ -514,6 +555,7 @@ export type PromaEvent =
   | { type: 'exit_plan_mode_request'; request: ExitPlanModeRequest }
   | { type: 'exit_plan_mode_resolved'; requestId: string }
   | { type: 'enter_plan_mode'; sessionId: string }
+  | { type: 'plan_mode_changed'; sessionId: string; active: boolean; source: AgentPlanModeChangeSource }
   | { type: 'retry'; status: 'starting' | 'attempt' | 'cleared' | 'failed'; attempt?: number; maxAttempts?: number; delaySeconds?: number; reason?: string; attemptData?: RetryAttempt; error?: TypedError }
   | { type: 'model_resolved'; model: string }
   | { type: 'permission_mode_changed'; mode: PromaPermissionMode }
@@ -563,6 +605,8 @@ export interface AgentSessionMeta {
   resumeAtMessageUuid?: string
   /** 手动标记为工作中 */
   manualWorking?: boolean
+  /** Agent 执行完成但用户尚未确认（跨重启保留在工作中列表） */
+  completedButUnconfirmed?: boolean
   /** 最后一次流式执行是否被用户主动中断 */
   stoppedByUser?: boolean
   /** 该会话当前的权限模式（持久化到磁盘，重启后恢复）。未设置时新会话默认 auto */
@@ -982,6 +1026,12 @@ export interface AgentPendingFile {
   previewUrl?: string
   /** 文件原始路径（从侧面板添加时设置，发送时跳过复制直接引用） */
   sourcePath?: string
+  /**
+   * 标记 sourcePath 指向的是剪贴板临时预览文件（os.tmpdir）。
+   * 这类文件可能被系统清理，发送时需读取其最新内容拷贝进 session 目录，
+   * 而非像侧面板真实文件那样原地引用。
+   */
+  isClipboardDraft?: boolean
 }
 
 /** Agent 文件保存到 session 的输入 */
@@ -1033,6 +1083,18 @@ export interface WorkspaceAttachFileInput {
   workspaceSlug: string
   /** 文件的绝对路径 */
   filePath: string
+}
+
+/** Worktree 仓库配置 */
+export interface WorkspaceWorktreeRepo {
+  /** 显示名称 */
+  name: string
+  /** 主仓库绝对路径 */
+  repoPath: string
+  /** Worktree 存放目录绝对路径 */
+  worktreesPath: string
+  /** 优先级（数字越小越优先） */
+  priority?: number
 }
 
 // ===== AskUserQuestion 交互式问答类型 =====
@@ -1226,6 +1288,8 @@ export const AGENT_IPC_CHANNELS = {
   TOGGLE_PIN: 'agent:toggle-pin',
   /** 切换会话手动工作中状态 */
   TOGGLE_MANUAL_WORKING: 'agent:toggle-manual-working',
+  /** 确认会话已完成（清除 completedButUnconfirmed 和 manualWorking） */
+  CONFIRM_WORKING_DONE: 'agent:confirm-working-done',
   /** 切换会话归档状态 */
   TOGGLE_ARCHIVE: 'agent:toggle-archive',
   /** 搜索会话消息内容 */
@@ -1344,6 +1408,12 @@ export const AGENT_IPC_CHANNELS = {
   GET_WORKSPACE_DIRECTORIES: 'agent:get-workspace-directories',
   /** 获取工作区附加文件列表 */
   GET_WORKSPACE_ATTACHED_FILES: 'agent:get-workspace-attached-files',
+  /** 获取工作区 worktree 仓库配置列表 */
+  GET_WORKTREE_REPOS: 'agent:get-worktree-repos',
+  /** 添加 worktree 仓库到工作区配置 */
+  ADD_WORKTREE_REPO: 'agent:add-worktree-repo',
+  /** 从工作区配置移除 worktree 仓库 */
+  REMOVE_WORKTREE_REPO: 'agent:remove-worktree-repo',
 
   // 文件系统操作
   /** 获取 session 工作路径 */

@@ -6,8 +6,8 @@
  */
 
 import * as React from 'react'
-import { useAtom, useAtomValue, useSetAtom } from 'jotai'
-import { X, FolderOpen, ExternalLink, RefreshCw, ChevronRight, MoreHorizontal, FolderSearch, Pencil, FolderInput, Info, FolderHeart, MessageSquarePlus } from 'lucide-react'
+import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
+import { X, FolderOpen, ExternalLink, ChevronRight, MoreHorizontal, FolderSearch, Pencil, FolderInput, Info, FolderHeart, MessageSquarePlus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
@@ -20,6 +20,7 @@ import { cn } from '@/lib/utils'
 import { FileBrowser, FileDropZone, FileTypeIcon, FileSearchBar, computeRevealAncestors, isPathUnderRoot, computeTreeRowLayout, AncestorGuides, STICKY_ROW_BASE_CLASS, canBeSticky } from '@/components/file-browser'
 import { DiffPanelTabBar } from '@/components/diff/DiffPanelTabBar'
 import { DiffChangesList } from '@/components/diff/DiffChangesList'
+import { WorktreeSelector } from '@/components/diff/WorktreeSelector'
 import {
   agentSidePanelOpenAtom,
   workspaceFilesVersionAtom,
@@ -32,8 +33,10 @@ import {
   agentPendingFilesAtomFamily,
   agentDiffRefreshVersionAtom,
   fileBrowserAutoRevealAtom,
+  agentSelectedWorktreeAtom,
 } from '@/atoms/agent-atoms'
-import { previewPanelOpenMapAtom, previewFileMapAtom } from '@/atoms/preview-atoms'
+import { previewPanelOpenMapAtom, previewFileMapAtom, type PreviewFile } from '@/atoms/preview-atoms'
+import { activeTabIdAtom, getPreviewTabTitle, openTab, tabsAtom } from '@/atoms/tab-atoms'
 import { detectIsWindows } from '@/lib/platform'
 import type { FileEntry, AgentPendingFile } from '@proma/shared'
 
@@ -52,10 +55,12 @@ function getMediaTypeFromFilename(filename: string): string {
 interface SidePanelProps {
   sessionId: string
   sessionPath: string | null
-  activeTab: 'files' | 'changes'
-  onTabChange: (tab: 'files' | 'changes') => void
+  activeTab: 'session' | 'workspace' | 'changes'
+  onTabChange: (tab: 'session' | 'workspace' | 'changes') => void
   width?: number
 }
+
+const filePanelActionButtonClass = 'h-6 w-6 flex-shrink-0 rounded-md text-muted-foreground/75 hover:bg-accent/70 hover:text-foreground [&_svg]:size-3.5'
 
 export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, width = 280 }: SidePanelProps): React.ReactElement {
   // per-session 侧面板状态（默认打开）
@@ -65,6 +70,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   // Tab 系统
   const previewFileMap = useAtomValue(previewFileMapAtom)
   const selectedFilePath = previewFileMap.get(sessionId)?.filePath
+  const store = useStore()
 
   // 预览面板 atoms
   const setPreviewFileMap = useSetAtom(previewFileMapAtom)
@@ -73,24 +79,54 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   // 用 ref 存 basePaths 相关值，避免声明顺序问题
   const basePathsRef = React.useRef<string[]>([])
 
+  const openPreviewTabForFile = React.useCallback((file: PreviewFile) => {
+    setPreviewFileMap((prev) => {
+      const m = new Map(prev)
+      m.set(sessionId, file)
+      return m
+    })
+    setPreviewOpenMap((prev) => { const m = new Map(prev); m.set(sessionId, false); return m })
+    const result = openTab(store.get(tabsAtom), {
+      type: 'preview',
+      sessionId,
+      title: getPreviewTabTitle(file.filePath),
+    })
+    store.set(tabsAtom, result.tabs)
+    store.set(activeTabIdAtom, result.activeTabId)
+  }, [sessionId, setPreviewFileMap, setPreviewOpenMap, store])
+
   const handleFilePreview = React.useCallback((filePath: string) => {
     const bp = basePathsRef.current
-    setPreviewFileMap((prev) => {
+    openPreviewTabForFile({
+      filePath,
+      previewOnly: true,
+      basePaths: bp.length > 0 ? bp : undefined,
+    })
+  }, [openPreviewTabForFile])
+
+  // Worktree 选择状态
+  const [selectedWorktreeMap, setSelectedWorktreeMap] = useAtom(agentSelectedWorktreeAtom)
+  const selectedWorktreePath = selectedWorktreeMap.get(sessionId) ?? null
+
+  const handleWorktreeSelect = React.useCallback((worktree: import('@proma/shared').WorktreeInfo | null) => {
+    setSelectedWorktreeMap((prev) => {
       const m = new Map(prev)
-      m.set(sessionId, { filePath, previewOnly: true, basePaths: bp.length > 0 ? bp : undefined })
+      m.set(sessionId, worktree?.path ?? null)
       return m
     })
-    setPreviewOpenMap((prev) => { const m = new Map(prev); m.set(sessionId, true); return m })
-  }, [sessionId, setPreviewFileMap, setPreviewOpenMap])
+    if (worktree) {
+      window.electronAPI.attachDirectory({ sessionId, directoryPath: worktree.path })
+    }
+  }, [sessionId, setSelectedWorktreeMap])
 
   const handleDiffFileClick = React.useCallback((filePath: string, _isUntracked: boolean, gitRoot?: string) => {
-    setPreviewFileMap((prev) => {
-      const m = new Map(prev)
-      m.set(sessionId, { filePath, dirPath: sessionPath || undefined, gitRoot })
-      return m
+    openPreviewTabForFile({
+      filePath,
+      dirPath: sessionPath || undefined,
+      gitRoot,
+      baseRef: selectedWorktreePath ? 'origin/main' : undefined,
     })
-    setPreviewOpenMap((prev) => { const m = new Map(prev); m.set(sessionId, true); return m })
-  }, [sessionId, sessionPath, setPreviewFileMap, setPreviewOpenMap])
+  }, [openPreviewTabForFile, sessionPath, selectedWorktreePath])
 
   // 动画标志：isOpen 变化时启用过渡动画，切换会话时即时显示
   const prevIsOpenRef = React.useRef(isOpen)
@@ -317,11 +353,6 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     setFilesVersion((prev) => prev + 1)
   }, [setFilesVersion])
 
-  // 手动刷新文件列表
-  const handleRefresh = React.useCallback(() => {
-    setFilesVersion((prev) => prev + 1)
-  }, [setFilesVersion])
-
   // 添加文件到聊天
   const pendingFiles = useAtomValue(agentPendingFilesAtomFamily(sessionId))
   const setPendingFiles = useSetAtom(agentPendingFilesAtomFamily(sessionId))
@@ -368,7 +399,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   return (
     <div
       className={cn(
-        'relative h-full flex-shrink-0 overflow-hidden titlebar-drag-region bg-content-area rounded-2xl shadow-xl',
+        'relative z-0 h-full flex-shrink-0 overflow-hidden titlebar-drag-region bg-content-area rounded-2xl shadow-xl',
         shouldAnimate && 'transition-[width] duration-300 ease-in-out',
         isOpen ? '' : '!w-0',
       )}
@@ -387,220 +418,201 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
 
           {activeTab === 'changes' ? (
             sessionPath ? (
-            <DiffChangesList
-              key={sessionId}
-              dirPath={sessionPath}
-              sessionId={sessionId}
-              sessionPath={sessionPath}
-              workspaceFilesPath={workspaceFilesPath || undefined}
-              extraPaths={extraPathsMemo}
-              refreshVersion={diffRefreshVersion}
-              selectedFilePath={selectedFilePath}
-              onFileClick={handleDiffFileClick}
-            />
+            <>
+              <WorktreeSelector
+                sessionId={sessionId}
+                workspaceSlug={workspaceSlug || ''}
+                selectedPath={selectedWorktreePath}
+                onSelect={handleWorktreeSelect}
+              />
+              <DiffChangesList
+                key={sessionId}
+                dirPath={sessionPath}
+                sessionId={sessionId}
+                sessionPath={sessionPath}
+                workspaceFilesPath={workspaceFilesPath || undefined}
+                extraPaths={extraPathsMemo}
+                refreshVersion={diffRefreshVersion}
+                selectedFilePath={selectedFilePath}
+                onFileClick={handleDiffFileClick}
+                worktreeMode={selectedWorktreePath ? { path: selectedWorktreePath, baseBranch: 'origin/main' } : undefined}
+              />
+            </>
             ) : (
               <div className="flex-1 flex items-center justify-center text-muted-foreground text-xs">等待会话初始化...</div>
             )
-          ) : (
-          <div className="flex-1 min-h-0 flex flex-col pt-0.5">
-                  {/* ===== 会话文件区（仅当 sessionPath 存在时显示） ===== */}
-                  {sessionPath && (
-                    <>
-                      <div className="flex items-center gap-1 pl-3 pr-2 h-[32px] flex-shrink-0">
-                        <FolderOpen className="size-3 text-muted-foreground" />
-                        <span className="text-[11px] font-medium text-muted-foreground">会话文件</span>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Info className="size-3 text-muted-foreground/50 cursor-help" />
-                          </TooltipTrigger>
-                          <TooltipContent side="bottom" className="max-w-[200px]">
-                            <p>当前会话的专属文件，仅本次对话的 Agent 可以访问</p>
-                          </TooltipContent>
-                        </Tooltip>
-                        <span className="text-[10px] text-muted-foreground/75 truncate flex-1" title={sessionPath}>
-                          {breadcrumb}
-                        </span>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              className="h-5 w-5 flex-shrink-0"
-                              onClick={() => window.electronAPI.openFile(sessionPath).catch(console.error)}
-                            >
-                              <ExternalLink className="size-2.5" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent side="bottom">
-                            <p>在 Finder 中打开</p>
-                          </TooltipContent>
-                        </Tooltip>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              className="h-5 w-5 flex-shrink-0"
-                              onClick={handleRefresh}
-                            >
-                              <RefreshCw className="size-2.5" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent side="bottom">
-                            <p>刷新文件列表</p>
-                          </TooltipContent>
-                        </Tooltip>
-                      </div>
-                      {/* ===== 文件搜索栏 ===== */}
-                      <FileSearchBar
-                        workspaceFilesPath={null}
-                        sessionPath={sessionPath}
-                        sessionAttachedDirs={attachedDirs}
-                        workspaceAttachedDirs={[]}
-                        placeholder="搜索会话文件..."
-                        sessionId={sessionId}
+          ) : activeTab === 'session' ? (
+            <div className="flex-1 min-h-0 flex flex-col pt-0.5 mx-2 mb-2">
+              {sessionPath ? (
+                <>
+                  <div className="flex items-center gap-1 px-2 h-[32px] flex-shrink-0">
+                    <FolderOpen className="size-3 text-muted-foreground" />
+                    <span className="text-[11px] font-medium text-muted-foreground">会话文件</span>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Info className="size-3 text-muted-foreground/50 cursor-help" />
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom" className="max-w-[200px]">
+                        <p>当前会话的专属文件，仅本次对话的 Agent 可以访问</p>
+                      </TooltipContent>
+                    </Tooltip>
+                    <span className="text-[10px] text-muted-foreground/70 truncate flex-1 min-w-0" title={sessionPath}>
+                      {breadcrumb}
+                    </span>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className={filePanelActionButtonClass}
+                          onClick={() => window.electronAPI.openFile(sessionPath).catch(console.error)}
+                        >
+                          <FolderSearch />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom">
+                        <p>在 Finder 中打开</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </div>
+                  <FileSearchBar
+                    workspaceFilesPath={null}
+                    sessionPath={sessionPath}
+                    sessionAttachedDirs={attachedDirs}
+                    workspaceAttachedDirs={[]}
+                    placeholder="搜索会话文件..."
+                    sessionId={sessionId}
+                    onFilePreview={handleFilePreview}
+                  />
+                  <div className="flex-1 min-h-0 overflow-y-auto scrollbar-thin">
+                    {attachedFiles.length > 0 && (
+                      <AttachedFilesSection
+                        attachedFiles={attachedFiles}
+                        onDetach={handleDetachFile}
+                        onAddToChat={handleAddToChat}
                         onFilePreview={handleFilePreview}
+                        allowedPaths={basePathsRef.current}
+                        sessionId={sessionId}
                       />
-                      {/* 会话文件内容区（独立滚动） */}
-                      <div className="flex-1 min-h-0 overflow-y-auto scrollbar-thin">
-                        {/* 附加文件列表 */}
-                        {attachedFiles.length > 0 && (
-                          <AttachedFilesSection
-                            attachedFiles={attachedFiles}
-                            onDetach={handleDetachFile}
-                            onAddToChat={handleAddToChat}
-                            onFilePreview={handleFilePreview}
-                            allowedPaths={basePathsRef.current}
-                            sessionId={sessionId}
-                          />
-                        )}
-                        {/* 附加目录列表（可展开目录树） */}
-                        {attachedDirs.length > 0 && (
-                          <AttachedDirsSection
-                            attachedDirs={attachedDirs}
-                            onDetach={handleDetachDirectory}
-                            refreshVersion={filesVersion}
-                            onAddToChat={handleAddToChat}
-                            onFilePreview={handleFilePreview}
-                            allowedPaths={basePathsRef.current}
-                            sessionId={sessionId}
-                          />
-                        )}
-                        {/* 会话文件浏览器 */}
-                        <>
-                          {hasSessionAttachedItems && (
-                            <div className="text-[11px] font-medium text-muted-foreground mb-1 px-3 pt-2">工作文件（存储于该工作区目录）</div>
-                          )}
-                          <FileBrowser rootPath={sessionPath} hideToolbar embedded hideEmpty={hasSessionAttachedItems} onAddToChat={handleAddToChat} onFilePreview={handleFilePreview} />
-                        </>
-                        {/* 会话文件拖拽上传区域 */}
-                        <FileDropZone
-                          workspaceSlug={workspaceSlug ?? ''}
-                          sessionId={sessionId}
-                          target="session"
-                          onFilesUploaded={handleFilesUploaded}
-                          onFilesAttached={handleSessionFilesAttached}
-                          onAttachFolder={handleAttachFolder}
-                          onFoldersDropped={handleSessionFoldersDropped}
-                        />
-                      </div>
+                    )}
+                    {attachedDirs.length > 0 && (
+                      <AttachedDirsSection
+                        attachedDirs={attachedDirs}
+                        onDetach={handleDetachDirectory}
+                        refreshVersion={filesVersion}
+                        onAddToChat={handleAddToChat}
+                        onFilePreview={handleFilePreview}
+                        allowedPaths={basePathsRef.current}
+                        sessionId={sessionId}
+                      />
+                    )}
+                    <>
+                      {hasSessionAttachedItems && (
+                        <div className="text-[11px] font-medium text-muted-foreground mb-1 px-3 pt-2">工作文件（存储于该工作区目录）</div>
+                      )}
+                      <FileBrowser rootPath={sessionPath} hideToolbar embedded hideEmpty={hasSessionAttachedItems} onAddToChat={handleAddToChat} onFilePreview={handleFilePreview} />
+                    </>
+                    <FileDropZone
+                      workspaceSlug={workspaceSlug ?? ''}
+                      sessionId={sessionId}
+                      target="session"
+                      onFilesUploaded={handleFilesUploaded}
+                      onFilesAttached={handleSessionFilesAttached}
+                      onAttachFolder={handleAttachFolder}
+                      onFoldersDropped={handleSessionFoldersDropped}
+                    />
+                  </div>
+                </>
+              ) : (
+                <div className="flex-1 flex items-center justify-center text-muted-foreground text-xs">等待会话初始化...</div>
+              )}
+            </div>
+          ) : (
+            <div className="flex-1 min-h-0 flex flex-col pt-0.5">
+              <div className="flex-1 min-h-0 flex flex-col mx-2 mb-2">
+                <div className="flex items-center gap-1 px-2 h-[32px] flex-shrink-0">
+                  <FolderHeart className="size-3 text-muted-foreground" />
+                  <span className="text-[11px] font-medium text-muted-foreground">工作区文件</span>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Info className="size-3 text-muted-foreground/50 cursor-help" />
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom" className="max-w-[220px]">
+                      <p>工作区内所有会话可访问的文件和文件夹，每个新对话都可以自动读取</p>
+                    </TooltipContent>
+                  </Tooltip>
+                  <div className="flex-1" />
+                  {workspaceFilesPath && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className={filePanelActionButtonClass}
+                          onClick={() => window.electronAPI.openFile(workspaceFilesPath).catch(console.error)}
+                        >
+                          <FolderSearch />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom">
+                        <p>在 Finder 中打开工作区文件目录</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  )}
+                </div>
+                <FileSearchBar
+                  workspaceFilesPath={workspaceFilesPath}
+                  sessionPath={null}
+                  sessionAttachedDirs={[]}
+                  workspaceAttachedDirs={wsAttachedDirs}
+                  placeholder="搜索工作区文件..."
+                  sessionId={sessionId}
+                  onFilePreview={handleFilePreview}
+                />
+                <div className="flex-1 min-h-0 overflow-y-auto pb-1 scrollbar-thin">
+                  {wsAttachedFiles.length > 0 && (
+                    <AttachedFilesSection
+                      attachedFiles={wsAttachedFiles}
+                      onDetach={handleDetachWorkspaceFile}
+                      onAddToChat={handleAddToChat}
+                      onFilePreview={handleFilePreview}
+                      allowedPaths={basePathsRef.current}
+                      sessionId={sessionId}
+                    />
+                  )}
+                  {wsAttachedDirs.length > 0 && (
+                    <AttachedDirsSection
+                      attachedDirs={wsAttachedDirs}
+                      onDetach={handleDetachWorkspaceDirectory}
+                      refreshVersion={filesVersion}
+                      onAddToChat={handleAddToChat}
+                      onFilePreview={handleFilePreview}
+                      allowedPaths={basePathsRef.current}
+                      sessionId={sessionId}
+                    />
+                  )}
+                  {workspaceFilesPath && (
+                    <>
+                      {hasWorkspaceAttachedItems && (
+                        <div className="text-[11px] font-medium text-muted-foreground mb-1 px-3 pt-2">工作文件（存储于该工作区目录）</div>
+                      )}
+                      <FileBrowser rootPath={workspaceFilesPath} hideToolbar embedded hideEmpty={hasWorkspaceAttachedItems} onAddToChat={handleAddToChat} onFilePreview={handleFilePreview} />
                     </>
                   )}
-                  {/* ===== 分隔线 ===== */}
-                  <div className="mx-3 my-3 border-t border-muted-foreground/20" />
-
-                  {/* ===== 工作区文件区 ===== */}
-                  <div className="flex-1 min-h-0 flex flex-col mx-2 mb-2">
-                    <div className="flex items-center gap-1 px-2 h-[32px] flex-shrink-0">
-                      <FolderHeart className="size-3 text-muted-foreground" />
-                      <span className="text-[11px] font-medium text-muted-foreground">工作区文件</span>
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Info className="size-3 text-muted-foreground/50 cursor-help" />
-                        </TooltipTrigger>
-                        <TooltipContent side="bottom" className="max-w-[220px]">
-                          <p>工作区内所有会话可访问的文件和文件夹，每个新对话都可以自动读取</p>
-                        </TooltipContent>
-                      </Tooltip>
-                      <div className="flex-1" />
-                      {workspaceFilesPath && (
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              className="h-5 w-5 flex-shrink-0"
-                              onClick={() => window.electronAPI.openFile(workspaceFilesPath).catch(console.error)}
-                            >
-                              <ExternalLink className="size-2.5" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent side="bottom">
-                            <p>在 Finder 中打开工作区文件目录</p>
-                          </TooltipContent>
-                        </Tooltip>
-                      )}
-                    </div>
-                    {/* ===== 文件搜索栏（工作区） ===== */}
-                    <FileSearchBar
-                      workspaceFilesPath={workspaceFilesPath}
-                      sessionPath={null}
-                      sessionAttachedDirs={[]}
-                      workspaceAttachedDirs={wsAttachedDirs}
-                      placeholder="搜索工作区文件..."
-                      sessionId={sessionId}
-                      onFilePreview={handleFilePreview}
-                    />
-                    {/* 工作区文件内容区（独立滚动） */}
-                    <div className="flex-1 min-h-0 overflow-y-auto pb-1 scrollbar-thin">
-                      {/* 工作区级附加文件 */}
-                      {wsAttachedFiles.length > 0 && (
-                        <AttachedFilesSection
-                          attachedFiles={wsAttachedFiles}
-                          onDetach={handleDetachWorkspaceFile}
-                          onAddToChat={handleAddToChat}
-                          onFilePreview={handleFilePreview}
-                          allowedPaths={basePathsRef.current}
-                          sessionId={sessionId}
-                        />
-                      )}
-                      {/* 工作区级附加目录 */}
-                      {wsAttachedDirs.length > 0 && (
-                        <AttachedDirsSection
-                          attachedDirs={wsAttachedDirs}
-                          onDetach={handleDetachWorkspaceDirectory}
-                          refreshVersion={filesVersion}
-                          onAddToChat={handleAddToChat}
-                          onFilePreview={handleFilePreview}
-                          allowedPaths={basePathsRef.current}
-                          sessionId={sessionId}
-                        />
-                      )}
-                      {/* 工作区文件浏览器 */}
-                      {workspaceFilesPath && (
-                        <>
-                          {hasWorkspaceAttachedItems && (
-                            <div className="text-[11px] font-medium text-muted-foreground mb-1 px-3 pt-2">工作文件（存储于该工作区目录）</div>
-                          )}
-                          <FileBrowser rootPath={workspaceFilesPath} hideToolbar embedded hideEmpty={hasWorkspaceAttachedItems} onAddToChat={handleAddToChat} onFilePreview={handleFilePreview} />
-                        </>
-                      )}
-                      {/* 工作区文件拖拽上传区域 */}
-                      <FileDropZone
-                        workspaceSlug={workspaceSlug ?? ''}
-                        target="workspace"
-                        onFilesUploaded={handleFilesUploaded}
-                        onFilesAttached={handleWorkspaceFilesAttached}
-                        onAttachFolder={handleAttachWorkspaceFolder}
-                        onFoldersDropped={handleWorkspaceFoldersDropped}
-                      />
-                    </div>
-                  </div>
+                  <FileDropZone
+                    workspaceSlug={workspaceSlug ?? ''}
+                    target="workspace"
+                    onFilesUploaded={handleFilesUploaded}
+                    onFilesAttached={handleWorkspaceFilesAttached}
+                    onAttachFolder={handleAttachWorkspaceFolder}
+                    onFoldersDropped={handleWorkspaceFoldersDropped}
+                  />
                 </div>
-              )}
+              </div>
+            </div>
+          )}
         </div>
     </div>
   )

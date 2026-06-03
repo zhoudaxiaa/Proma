@@ -17,7 +17,7 @@ import * as React from 'react'
 import { unstable_batchedUpdates } from 'react-dom'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
 import { toast } from 'sonner'
-import { Bot, CornerDownLeft, Square, Settings, Paperclip, FolderPlus, X, Copy, Check, Brain, Map as MapIcon, Sparkles, Eye } from 'lucide-react'
+import { Bot, CornerDownLeft, Square, Settings, Paperclip, FolderPlus, X, Copy, Check, Brain, Sparkles, Eye } from 'lucide-react'
 import { AgentMessages } from './AgentMessages'
 import { AgentHeader } from './AgentHeader'
 import { ContextUsageBadge } from './ContextUsageBadge'
@@ -69,6 +69,8 @@ import {
   agentSessionDraftHtmlAtomFamily,
   agentPromptSuggestionsAtom,
   agentMessageRefreshAtom,
+  agentSDKMessagesCacheAtom,
+  setSessionMessagesCache,
   agentDiffRefreshVersionAtom,
   agentSessionsAtom,
   agentAttachedDirectoriesMapAtom,
@@ -95,39 +97,15 @@ import { useOpenSession } from '@/hooks/useOpenSession'
 import { AgentSessionProvider } from '@/contexts/session-context'
 import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
 import { sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
+import { activeTabIdAtom, getPreviewTabTitle, openTab, tabsAtom } from '@/atoms/tab-atoms'
 import type { AgentSendInput, AgentPendingFile, FileDialogLargeFile, ModelOption, SDKMessage } from '@proma/shared'
 import { MAX_ATTACHMENT_SIZE } from '@proma/shared'
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
+import { createClipboardPendingFile, createClipboardTextDraft, makeUniqueAttachmentName } from '@/lib/clipboard-text-attachment'
 
 /** 稳定的空 SDKMessage 数组引用，避免 ?? [] 每次创建新引用 */
 const EMPTY_SDK_MESSAGES: SDKMessage[] = []
 const LONG_TEXT_ATTACHMENT_THRESHOLD = 2000
-
-function formatClipboardTimestamp(date = new Date()): string {
-  const pad = (value: number): string => String(value).padStart(2, '0')
-  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
-}
-
-function looksLikeMarkdown(text: string): boolean {
-  return [
-    /^#{1,6}\s+\S/m,
-    /```[\s\S]*?```/,
-    /^\s*\|.+\|\s*\n\s*\|[\s:-]+\|/m,
-    /^---\n[\s\S]*?\n---\n/,
-    /^\s*> .+/m,
-    /^\s*[-*+]\s+\S/m,
-    /^\s*\d+\.\s+\S/m,
-    /\[[^\]]+\]\([^)]+\)/,
-  ].some((pattern) => pattern.test(text))
-}
-
-function createClipboardTextFile(text: string): File {
-  const isMarkdown = looksLikeMarkdown(text)
-  const extension = isMarkdown ? 'md' : 'txt'
-  const mediaType = isMarkdown ? 'text/markdown' : 'text/plain'
-  const filename = `clipboard-${formatClipboardTimestamp()}.${extension}`
-  return new File([text], filename, { type: mediaType })
-}
 
 interface SDKMessageRecord {
   type?: string
@@ -324,6 +302,8 @@ function DisplayOptionsPopover({
 
 export function AgentView({ sessionId }: { sessionId: string }): React.ReactElement {
   const [persistedSDKMessages, setPersistedSDKMessages] = React.useState<SDKMessage[]>([])
+  const persistedSDKMessagesRef = React.useRef<SDKMessage[]>(EMPTY_SDK_MESSAGES)
+  persistedSDKMessagesRef.current = persistedSDKMessages
   const setStreamingStates = useSetAtom(agentStreamingStatesAtom)
   // 按 sessionId 切片订阅：仅本 session 的 streaming state 变化才让 AgentView 重渲染。
   // 流式期间其他 session 的高频更新（每 token 一次）通过 base map atom 传播但派生
@@ -636,6 +616,17 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const refreshMap = useAtomValue(agentMessageRefreshAtom)
   const refreshVersion = refreshMap.get(sessionId) ?? 0
 
+  // 持久化消息缓存 setter — 仅写入，读取时用 store.get 同步取值避免订阅触发重渲染
+  const setMessagesCache = useSetAtom(agentSDKMessagesCacheAtom)
+  const appendOptimisticPersistedMessage = React.useCallback((message: SDKMessage) => {
+    // 切会话时优先命中内存缓存，因此乐观插入的用户消息也要同步写入缓存，
+    // 否则“发送后立刻切走再切回”会短暂回退到旧消息数组。
+    const next = [...persistedSDKMessagesRef.current, message]
+    persistedSDKMessagesRef.current = next
+    setPersistedSDKMessages(next)
+    setMessagesCache((prev) => setSessionMessagesCache(prev, sessionId, next))
+  }, [sessionId, setMessagesCache])
+
   // 消息是否已完成首次加载（用于 auto-send 等待）
   const [messagesLoaded, setMessagesLoaded] = React.useState(false)
   const loadingSessionIdRef = React.useRef<string | null>(null)
@@ -644,15 +635,28 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   React.useEffect(() => {
     // 只有切换会话时才进入 loading 态；同一会话在流式完成后的刷新要保留当前
     // persisted/live 消息，避免“助手气泡先消失、持久化消息再恢复”的空窗跳动。
-    if (loadingSessionIdRef.current !== sessionId) {
+    const isSessionSwitch = loadingSessionIdRef.current !== sessionId
+    if (isSessionSwitch) {
       loadingSessionIdRef.current = sessionId
-      setPersistedSDKMessages([])
-      setMessagesLoaded(false)
+      // 命中缓存则立即填充，消除「先清空 → 等 IPC 全量读盘」的可见空窗；
+      // IPC 返回后仍会以最新数据覆盖。未命中才回退到清空 + loading 态。
+      // 注意：refreshVersion bump（流结束/出错/rewind）不是会话切换，
+      // 走 else 分支保留当前消息，并在下方 IPC 覆盖时获得最新数据。
+      const cached = store.get(agentSDKMessagesCacheAtom).get(sessionId)
+      if (cached) {
+        setPersistedSDKMessages(cached)
+        setMessagesLoaded(true)
+      } else {
+        setPersistedSDKMessages([])
+        setMessagesLoaded(false)
+      }
     }
     let cancelled = false
     window.electronAPI.getAgentSessionSDKMessages(sessionId)
       .then((sdkMsgs) => {
         if (cancelled) return
+        // 写入缓存（含 LRU 淘汰，防止会话数增长导致内存无限膨胀）
+        setMessagesCache((prev) => setSessionMessagesCache(prev, sessionId, sdkMsgs))
         unstable_batchedUpdates(() => {
           setPersistedSDKMessages(sdkMsgs)
           setMessagesLoaded(true)
@@ -696,7 +700,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       })
       .catch(console.error)
     return () => { cancelled = true }
-  }, [sessionId, refreshVersion, setStreamingStates, setLiveMessagesMap, store])
+  }, [sessionId, refreshVersion, setStreamingStates, setLiveMessagesMap, setMessagesCache, store])
 
   // 从会话元数据初始化附加目录（仅冷启动水合，后续由 handleAttachFolder/handleDetachDirectory 实时写入）
   React.useEffect(() => {
@@ -774,7 +778,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         parent_tool_use_id: null,
         _createdAt: Date.now(),
       } as unknown as SDKMessage
-      setPersistedSDKMessages((prev) => [...prev, tempUserSDKMsg])
+      appendOptimisticPersistedMessage(tempUserSDKMsg)
 
       // 发送消息
       const input: AgentSendInput = {
@@ -805,15 +809,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
 
   /** 为文件生成唯一文件名（避免粘贴多张图片时文件名重复导致覆盖） */
   const makeUniqueFilename = React.useCallback((originalName: string, existingNames: string[]): string => {
-    if (!existingNames.includes(originalName)) return originalName
-    const dotIdx = originalName.lastIndexOf('.')
-    const baseName = dotIdx > 0 ? originalName.slice(0, dotIdx) : originalName
-    const ext = dotIdx > 0 ? originalName.slice(dotIdx) : ''
-    let counter = 1
-    while (existingNames.includes(`${baseName}-${counter}${ext}`)) {
-      counter++
-    }
-    return `${baseName}-${counter}${ext}`
+    return makeUniqueAttachmentName(originalName, existingNames)
   }, [])
 
   const attachSessionFile = React.useCallback(async (filePath: string): Promise<void> => {
@@ -1012,8 +1008,39 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     })
   }, [setPendingFiles])
 
-  /** 点击 clipboard 附件时，在右侧预览面板中显示内容 */
+  const openClipboardPreviewFile = React.useCallback((filePath: string): void => {
+    const parentPath = getFileParentPath(filePath)
+    setPreviewFileMap((prev) => {
+      const m = new Map(prev)
+      m.set(sessionId, {
+        filePath,
+        previewOnly: true,
+        readOnly: false,
+        basePaths: parentPath ? [parentPath] : undefined,
+      })
+      return m
+    })
+    store.set(previewPanelOpenMapAtom, (prev) => {
+      const m = new Map(prev)
+      m.set(sessionId, false)
+      return m
+    })
+    const result = openTab(store.get(tabsAtom), {
+      type: 'preview',
+      sessionId,
+      title: getPreviewTabTitle(filePath),
+    })
+    store.set(tabsAtom, result.tabs)
+    store.set(activeTabIdAtom, result.activeTabId)
+  }, [sessionId, setPreviewFileMap, store])
+
+  /** 点击 clipboard 附件时，在当前会话的临时预览标签页中显示内容 */
   const handleClipboardPreview = React.useCallback(async (file: AgentPendingFile) => {
+    if (file.sourcePath) {
+      openClipboardPreviewFile(file.sourcePath)
+      return
+    }
+
     const base64 = window.__pendingAgentFileData?.get(file.id)
     if (!base64) return
 
@@ -1022,17 +1049,31 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
       const text = new TextDecoder('utf-8').decode(bytes)
       const tmpPath = await window.electronAPI.writeClipboardPreview(file.filename, text)
-      const tmpDir = tmpPath.substring(0, tmpPath.lastIndexOf('/'))
-      setPreviewFileMap((prev) => {
-        const m = new Map(prev)
-        m.set(sessionId, { filePath: tmpPath, previewOnly: true, readOnly: true, basePaths: [tmpDir] })
-        return m
-      })
-      store.set(previewPanelOpenMapAtom, (prev) => { const m = new Map(prev); m.set(sessionId, true); return m })
+      setPendingFiles((prev) => prev.map((item) => (
+        item.id === file.id ? { ...item, sourcePath: tmpPath, isClipboardDraft: true } : item
+      )))
+      window.__pendingAgentFileData?.delete(file.id)
+      openClipboardPreviewFile(tmpPath)
     } catch (error) {
       console.error('[AgentView] clipboard 预览写入失败:', error)
     }
-  }, [sessionId, setPreviewFileMap, store])
+  }, [openClipboardPreviewFile, setPendingFiles])
+
+  const addClipboardTextDraft = React.useCallback(async (text: string): Promise<AgentPendingFile> => {
+    const draft = createClipboardTextDraft(text, pendingFilesRef.current.map((f) => f.filename))
+    const tmpPath = await window.electronAPI.writeClipboardPreview(draft.filename, text)
+    const pending = createClipboardPendingFile(
+      draft,
+      tmpPath,
+      `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    )
+    setPendingFiles((prev) => {
+      const next = [...prev, pending]
+      pendingFilesRef.current = next
+      return next
+    })
+    return pending
+  }, [setPendingFiles])
 
   /** 粘贴文件处理 */
   const handlePasteFiles = React.useCallback((files: File[]): void => {
@@ -1041,18 +1082,17 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
 
   /** 粘贴超长文本时转为待发送附件，避免把大段内容直接塞进输入框 */
   const handlePasteLongText = React.useCallback((text: string): void => {
-    const file = createClipboardTextFile(text)
-    addFilesAsAttachments([file])
-      .then(() => {
+    addClipboardTextDraft(text)
+      .then((file) => {
         toast.success('已将超长文本转为附件', {
-          description: file.name,
+          description: `${file.filename}，点击附件可预览编辑。`,
         })
       })
       .catch((error) => {
         console.error('[AgentView] 超长文本转附件失败:', error)
         toast.error('超长文本转附件失败')
       })
-  }, [addFilesAsAttachments])
+  }, [addClipboardTextDraft])
 
   /** 拖放处理 */
   const handleDragOver = React.useCallback((e: React.DragEvent): void => {
@@ -1177,7 +1217,8 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     const text = inputContent.trim()
     // 如果输入为空但有建议，使用建议内容
     const effectiveText = text || suggestion || ''
-    if ((!effectiveText && pendingFiles.length === 0) || !agentChannelId || !hasAvailableModel) return
+    const pendingFilesSnapshot = pendingFilesRef.current
+    if ((!effectiveText && pendingFilesSnapshot.length === 0) || !agentChannelId || !hasAvailableModel) return
     const additionalDirectoriesForRun = new Set(attachedDirs)
     for (const dir of attachedFileDirectories) {
       additionalDirectoriesForRun.add(dir)
@@ -1186,7 +1227,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     // 上一条消息仍在处理中，直接追加发送
     if (streaming) {
       // 流式追加时不处理附件（仅支持纯文本）
-      if (pendingFiles.length > 0) {
+      if (pendingFilesSnapshot.length > 0) {
         toast.info('Agent 运行中暂不支持追加发送附件', {
           description: '请等待完成后再发送附件，或先撤除附件仅发送文本',
         })
@@ -1263,7 +1304,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
 
     // 1. 如果有 pending 文件，先保存到 session 目录
     let fileReferences = ''
-    if (pendingFiles.length > 0) {
+    if (pendingFilesSnapshot.length > 0) {
       const workspace = workspaces.find((w) => w.id === currentWorkspaceId)
       if (!workspace) {
         toast.warning('暂时无法发送附件', {
@@ -1272,9 +1313,14 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         return
       }
 
-      // 区分：已有 sourcePath 的文件（从侧面板添加）直接引用，其余需要保存
-      const existingFiles = pendingFiles.filter((f) => f.sourcePath)
-      const newFiles = pendingFiles.filter((f) => !f.sourcePath)
+      // 区分三类：
+      // - 剪贴板临时草稿（isClipboardDraft）：sourcePath 指向 os.tmpdir，可能被系统清理，
+      //   需读取最新内容（含预览面板 autosave 的编辑）拷贝进 session 目录持久化
+      // - 侧面板真实文件（仅 sourcePath）：原地引用，不复制
+      // - 新上传文件（无 sourcePath）：从内存数据保存到 session 目录
+      const existingFiles = pendingFilesSnapshot.filter((f) => f.sourcePath && !f.isClipboardDraft)
+      const clipboardDrafts = pendingFilesSnapshot.filter((f) => f.sourcePath && f.isClipboardDraft)
+      const newFiles = pendingFilesSnapshot.filter((f) => !f.sourcePath)
 
       const allRefs: Array<{ filename: string; targetPath: string }> = []
 
@@ -1286,20 +1332,50 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         if (parentPath) additionalDirectoriesForRun.add(parentPath)
       }
 
-      // 新上传的文件保存到 session 目录
-      if (newFiles.length > 0) {
-        const filesToSave = newFiles.map((f) => ({
-          filename: f.filename,
-          data: window.__pendingAgentFileData?.get(f.id) || '',
-        }))
-        const missingDataFiles = filesToSave.filter((f) => !f.data).map((f) => f.filename)
-        if (missingDataFiles.length > 0) {
-          toast.error('附件数据已失效', {
-            description: `请移除后重新添加文件：${missingDataFiles.join('、')}`,
+      // 剪贴板草稿：读取临时文件最新内容，转为待保存数据
+      const draftFilesToSave: Array<{ filename: string; data: string }> = []
+      const staleDraftFiles: string[] = []
+      for (const f of clipboardDrafts) {
+        const sourcePath = f.sourcePath!
+        const parentPath = getFileParentPath(sourcePath)
+        try {
+          const read = await window.electronAPI.resolveAndReadFile(sourcePath, {
+            sessionId,
+            candidateBasePaths: parentPath ? [parentPath] : undefined,
           })
-          return
+          if (!read) {
+            staleDraftFiles.push(f.filename)
+            continue
+          }
+          const data = await fileToBase64(new File([read.content], f.filename, { type: f.mediaType }))
+          draftFilesToSave.push({ filename: f.filename, data })
+        } catch (error) {
+          console.error('[AgentView] 读取剪贴板草稿失败:', error)
+          staleDraftFiles.push(f.filename)
         }
+      }
+      if (staleDraftFiles.length > 0) {
+        toast.error('附件数据已失效', {
+          description: `请移除后重新粘贴：${staleDraftFiles.join('、')}`,
+        })
+        return
+      }
 
+      // 新上传的文件 + 剪贴板草稿一并保存到 session 目录
+      const inMemoryFilesToSave = newFiles.map((f) => ({
+        filename: f.filename,
+        data: window.__pendingAgentFileData?.get(f.id) || '',
+      }))
+      const missingDataFiles = inMemoryFilesToSave.filter((f) => !f.data).map((f) => f.filename)
+      if (missingDataFiles.length > 0) {
+        toast.error('附件数据已失效', {
+          description: `请移除后重新添加文件：${missingDataFiles.join('、')}`,
+        })
+        return
+      }
+
+      const filesToSave = [...inMemoryFilesToSave, ...draftFilesToSave]
+      if (filesToSave.length > 0) {
         try {
           const saved = await window.electronAPI.saveFilesToAgentSession({
             workspaceSlug: workspace.slug,
@@ -1327,7 +1403,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       fileReferences += `<attached_files>\n${refs}\n</attached_files>\n\n`
 
       // 清理
-      for (const f of pendingFiles) {
+      for (const f of pendingFilesSnapshot) {
         if (f.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(f.previewUrl)
         window.__pendingAgentFileData?.delete(f.id)
       }
@@ -1401,7 +1477,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       parent_tool_use_id: null,
       _createdAt: Date.now(),
     } as unknown as SDKMessage
-    setPersistedSDKMessages((prev) => [...prev, tempUserSDKMsg])
+    appendOptimisticPersistedMessage(tempUserSDKMsg)
 
     const input: AgentSendInput = {
       sessionId,
@@ -1438,7 +1514,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         return map
       })
     })
-  }, [inputContent, pendingFiles, attachedDirs, attachedFileDirectories, sessionId, agentChannelId, agentModelId, currentWorkspaceId, workspaces, streaming, suggestion, hasAvailableModel, store, setStreamingStates, setPendingFiles, setAgentStreamErrors, setPromptSuggestions, setInputContent, setLiveMessagesMap, permissionMode])
+  }, [inputContent, attachedDirs, attachedFileDirectories, sessionId, agentChannelId, agentModelId, currentWorkspaceId, workspaces, streaming, suggestion, hasAvailableModel, store, setStreamingStates, setPendingFiles, setAgentStreamErrors, setPromptSuggestions, setInputContent, setLiveMessagesMap, permissionMode])
 
   /** 停止生成 */
   const handleStop = React.useCallback((): void => {
@@ -1940,15 +2016,6 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
 
         {/* AskUserQuestion 交互式问答横幅 */}
         <AskUserBanner sessionId={sessionId} />
-
-        {/* Plan 模式指示条 */}
-        {isPlanMode && (
-          <div className="mx-4 mb-2 flex items-center gap-2 px-3 py-2 rounded-lg bg-primary/5 text-primary text-sm animate-in fade-in slide-in-from-bottom-1 duration-200">
-            <MapIcon className="size-4 animate-pulse" />
-            <span className="font-medium">Agent 正在规划中...</span>
-            <span className="text-xs text-muted-foreground">完成后将请求你的审批</span>
-          </div>
-        )}
 
         {/* ExitPlanMode 计划审批横幅 */}
         <ExitPlanModeBanner sessionId={sessionId} />

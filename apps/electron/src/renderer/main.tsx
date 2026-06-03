@@ -50,7 +50,7 @@ import {
 } from './atoms/markdown-font-size'
 import { useGlobalAgentListeners } from './hooks/useGlobalAgentListeners'
 import { useGlobalChatListeners } from './hooks/useGlobalChatListeners'
-import { tabsAtom, activeTabIdAtom, ensureScratchPadTab, scratchPadContentAtom, scratchPadLoadedAtom, SCRATCH_PAD_ID } from './atoms/tab-atoms'
+import { tabsAtom, activeTabIdAtom, ensureScratchPadTab, getPersistableTabState, scratchPadContentAtom, scratchPadLoadedAtom, SCRATCH_PAD_ID } from './atoms/tab-atoms'
 import type { TabItem } from './atoms/tab-atoms'
 import { chatToolsAtom } from './atoms/chat-tool-atoms'
 import { feishuBotStatesAtom } from './atoms/feishu-atoms'
@@ -676,6 +676,7 @@ function TabStatePersistenceInitializer(): null {
           'sessionId' in t &&
           'type' in t &&
           'title' in t &&
+          (t.type === 'chat' || t.type === 'agent') &&
           validSessionIds.has(t.sessionId),
       )
       if (validTabs.length === 0) {
@@ -699,21 +700,22 @@ function TabStatePersistenceInitializer(): null {
         }
       }
 
-      store.set(tabsAtom, ensureScratchPadTab(validTabs))
+      const activeTab = validTabs.find((t) => t.id === restoredActiveTabId) ?? validTabs[0] ?? null
+      store.set(tabsAtom, ensureScratchPadTab(activeTab ? [activeTab] : []))
       store.set(activeTabIdAtom, restoredActiveTabId)
 
       // 同步 appMode 和 currentSessionId
-      const activeTab = validTabs.find((t) => t.id === restoredActiveTabId)
       if (activeTab) {
-        store.set(appModeAtom, activeTab.type)
         if (activeTab.type === 'chat') {
+          store.set(appModeAtom, 'chat')
           store.set(currentConversationIdAtom, activeTab.sessionId)
         } else {
+          store.set(appModeAtom, 'agent')
           store.set(currentAgentSessionIdAtom, activeTab.sessionId)
         }
       }
 
-      console.log(`[TabRestore] 已恢复 ${validTabs.length} 个标签页`)
+      console.log(`[TabRestore] 已恢复当前会话入口，历史标签 ${validTabs.length} 个已收敛到左侧列表`)
     }).catch((err) => console.error('[TabRestore] 恢复标签页失败:', err))
       .finally(() => { restoredRef.current = true })
   }, [store])
@@ -725,10 +727,9 @@ function TabStatePersistenceInitializer(): null {
     const save = (): void => {
       const tabs = store.get(tabsAtom)
       const activeTabId = store.get(activeTabIdAtom)
-      // 过滤掉 scratch tab，它由代码注入，不参与 tabState 持久化
-      const persistTabs = tabs.filter((t) => t.id !== SCRATCH_PAD_ID)
+      const persistableTabState = getPersistableTabState(tabs, activeTabId)
       window.electronAPI.updateSettings({
-        tabState: { tabs: persistTabs, activeTabId },
+        tabState: persistableTabState,
       }).catch(console.error)
     }
 
@@ -747,9 +748,9 @@ function TabStatePersistenceInitializer(): null {
       // 使用同步 IPC 确保关闭前数据写入磁盘
       const tabs = store.get(tabsAtom)
       const activeTabId = store.get(activeTabIdAtom)
-      const persistTabs = tabs.filter((t) => t.id !== SCRATCH_PAD_ID)
+      const persistableTabState = getPersistableTabState(tabs, activeTabId)
       if (tabs.length > 0 && window.electronAPI.updateSettingsSync) {
-        const ok = window.electronAPI.updateSettingsSync({ tabState: { tabs: persistTabs, activeTabId } })
+        const ok = window.electronAPI.updateSettingsSync({ tabState: persistableTabState })
         if (!ok) {
           console.warn('[TabPersist] sync IPC failed, falling back to async save')
           save()
