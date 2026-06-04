@@ -94,6 +94,8 @@ mac:
 
 # DMG 配置
 dmg:
+  # 使用 ULFO 格式避免 hdiutil resize 在 APFS 上失败
+  format: ULFO
   contents:
     - x: 130
       y: 220

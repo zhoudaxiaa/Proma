@@ -1,5 +1,7 @@
 # dependencies (bun install)
 node_modules
+.codegraph
+pnpm-lock.yaml
 
 # output
 out

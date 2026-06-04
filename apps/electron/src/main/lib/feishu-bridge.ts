@@ -228,10 +228,15 @@ class FeishuBridge {
       // 关键收益：channel.on({cardAction}) 能拿到卡片按钮回调（老 WSClient.handleEventData
       // 只处理 MessageType.event 通道，会直接丢掉 MessageType.card 帧）
       // 其余调用通过 channel.rawClient 路由，所有现有 client.* API 零改动
+      const larkDomain = this.botConfig.domain === 'lark' ? lark.Domain.Lark : lark.Domain.Feishu
+      const domainBaseUrl = larkDomain === lark.Domain.Lark ? 'https://open.larksuite.com' : 'https://open.feishu.cn'
+
+      console.log(`[飞书 Bridge] 正在启动 Bot "${this.botConfig.name}", domain=${this.botConfig.domain ?? 'feishu'}, domainBaseUrl=${domainBaseUrl}`)
+
       this.channel = lark.createLarkChannel({
         appId,
         appSecret: plainSecret,
-        domain: lark.Domain.Feishu,
+        domain: larkDomain,
         loggerLevel: lark.LoggerLevel.warn,
         policy: {
           dmMode: 'open',
@@ -253,7 +258,7 @@ class FeishuBridge {
           data?: { bot?: { open_id?: string; app_name?: string } }
         }>({
           method: 'GET',
-          url: 'https://open.feishu.cn/open-apis/bot/v3/info/',
+          url: `${domainBaseUrl}/open-apis/bot/v3/info/`,
         })
         console.log('[飞书 Bridge] Bot info 响应:', JSON.stringify(botInfoResp, null, 2))
         // 飞书 API 返回 bot 在顶层，Lark SDK 可能包装在 data 下，兼容两种
@@ -568,13 +573,15 @@ class FeishuBridge {
 
   // ===== 连接测试 =====
 
-  async testConnection(appId: string, appSecret: string): Promise<FeishuTestResult> {
+  async testConnection(appId: string, appSecret: string, domain?: 'feishu' | 'lark'): Promise<FeishuTestResult> {
     try {
       const lark = await import('@larksuiteoapi/node-sdk')
+      const larkDomain = domain === 'lark' ? lark.Domain.Lark : lark.Domain.Feishu
       const client = new lark.Client({
         appId,
         appSecret,
         appType: lark.AppType.SelfBuild,
+        domain: larkDomain,
       })
 
       // 通过获取 tenant_access_token 来验证凭证
@@ -2017,7 +2024,7 @@ class FeishuBridge {
           data?: { bot?: { open_id?: string } }
         }>({
           method: 'GET',
-          url: 'https://open.feishu.cn/open-apis/bot/v3/info/',
+          url: `${this.botConfig.domain === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn'}/open-apis/bot/v3/info/`,
         })
         this.botOpenId = botInfoResp?.bot?.open_id ?? botInfoResp?.data?.bot?.open_id ?? null
         if (this.botOpenId) {

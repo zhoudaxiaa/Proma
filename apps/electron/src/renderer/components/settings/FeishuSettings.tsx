@@ -999,6 +999,7 @@ function BotConfigCard({ bot, state, onSaved, onRemoved }: BotConfigCardProps): 
   const [name, setName] = React.useState(bot.name)
   const [appId, setAppId] = React.useState(bot.appId)
   const [appSecret, setAppSecret] = React.useState('')
+  const [domain, setDomain] = React.useState<'feishu' | 'lark'>(bot.domain ?? 'feishu')
   const [testing, setTesting] = React.useState(false)
   const [testResult, setTestResult] = React.useState<FeishuTestResult | null>(null)
   const [expanded, setExpanded] = React.useState(!bot.appId) // 新建的 Bot 默认展开
@@ -1029,6 +1030,7 @@ function BotConfigCard({ bot, state, onSaved, onRemoved }: BotConfigCardProps): 
         enabled: true,
         appId: appId.trim(),
         appSecret: appSecret || '',
+        domain: domain,
         defaultWorkspaceId: bot.defaultWorkspaceId,
         defaultChannelId: bot.defaultChannelId,
         defaultModelId: bot.defaultModelId,
@@ -1038,21 +1040,21 @@ function BotConfigCard({ bot, state, onSaved, onRemoved }: BotConfigCardProps): 
     } catch {
       toast.error('保存配置失败')
     }
-  }, [bot.id, name, appId, appSecret, onSaved])
+  }, [bot.id, name, appId, appSecret, domain, onSaved])
 
   const handleTest = React.useCallback(async () => {
     if (!appId.trim() || !appSecret.trim()) return
     setTesting(true)
     setTestResult(null)
     try {
-      const result = await window.electronAPI.testFeishuConnection(appId.trim(), appSecret.trim())
+      const result = await window.electronAPI.testFeishuConnection(appId.trim(), appSecret.trim(), domain)
       setTestResult(result)
     } catch (err) {
       setTestResult({ success: false, message: `测试失败: ${err instanceof Error ? err.message : String(err)}` })
     } finally {
       setTesting(false)
     }
-  }, [appId, appSecret])
+  }, [appId, appSecret, domain])
 
   /** 操作完成后主动拉取最新状态，确保 UI 同步 */
   const refreshBotStates = React.useCallback(async () => {
@@ -1165,6 +1167,23 @@ function BotConfigCard({ bot, state, onSaved, onRemoved }: BotConfigCardProps): 
             onChange={setAppSecret}
             placeholder="输入 App Secret"
           />
+
+          {/* 平台域名选择 */}
+          <div className="px-4 py-3 space-y-1.5">
+            <label className="text-sm font-medium text-foreground">平台域名</label>
+            <Select
+              value={domain}
+              onValueChange={(v) => setDomain(v as 'feishu' | 'lark')}
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="feishu">飞书（中国版 — open.feishu.cn）</SelectItem>
+                <SelectItem value="lark">Lark（国际版 — open.larksuite.com）</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
 
           <div className="flex items-center gap-3">
             <Button size="sm" variant="outline" onClick={handleTest}

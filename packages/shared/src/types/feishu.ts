@@ -48,6 +48,8 @@ export interface FeishuBotConfig {
   defaultChannelId?: string
   /** 该 Bot 的默认模型 ID */
   defaultModelId?: string
+  /** 飞书平台域名：'feishu'（中国版 open.feishu.cn）或 'lark'（国际版 open.larksuite.com），默认 'feishu' */
+  domain?: 'feishu' | 'lark'
 }
 
 /** 多 Bot 配置文件（~/.proma/feishu.json 新格式） */
@@ -74,6 +76,8 @@ export interface FeishuBotConfigInput {
   defaultChannelId?: string
   /** 默认模型 ID */
   defaultModelId?: string
+  /** 飞书平台域名：'feishu' 或 'lark'，不传则保持原值 */
+  domain?: 'feishu' | 'lark'
 }
 
 // ===== Session 镜像 =====

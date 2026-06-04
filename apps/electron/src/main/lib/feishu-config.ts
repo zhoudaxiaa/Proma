@@ -62,6 +62,7 @@ function migrateV1ToV2(v1: FeishuConfig): FeishuMultiBotConfig {
     appId: v1.appId,
     appSecret: v1.appSecret,
     defaultWorkspaceId: v1.defaultWorkspaceId,
+    domain: 'feishu',
   }
   return { version: 2, bots: [bot] }
 }
@@ -132,6 +133,7 @@ export function saveFeishuBotConfig(input: FeishuBotConfigInput): FeishuBotConfi
       defaultWorkspaceId: input.defaultWorkspaceId ?? existing.defaultWorkspaceId,
       defaultChannelId: input.defaultChannelId ?? existing.defaultChannelId,
       defaultModelId: input.defaultModelId ?? existing.defaultModelId,
+      domain: input.domain ?? existing.domain ?? 'feishu',
     }
     config.bots[idx] = updated
     writeMultiConfig(config)
@@ -149,6 +151,7 @@ export function saveFeishuBotConfig(input: FeishuBotConfigInput): FeishuBotConfi
     defaultWorkspaceId: input.defaultWorkspaceId,
     defaultChannelId: input.defaultChannelId,
     defaultModelId: input.defaultModelId,
+    domain: input.domain ?? 'feishu',
   }
   config.bots.push(bot)
   writeMultiConfig(config)
