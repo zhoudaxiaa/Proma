@@ -39,7 +39,6 @@ import {
   workspaceAttachedDirectoriesMapAtom,
   workspaceAttachedFilesMapAtom,
   unviewedCompletedSessionIdsAtom,
-  workingDoneSessionIdsAtom,
   agentSessionPathMapAtom,
   agentDiffRefreshVersionAtom,
 } from '@/atoms/agent-atoms'
@@ -150,6 +149,8 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
         return [{ type: 'model_resolved', model: evt.model }]
       case 'permission_mode_changed':
         return [{ type: 'permission_mode_changed', mode: evt.mode }]
+      case 'run_resumed':
+        return [{ type: 'run_resumed' }]
       case 'retry': {
         const events: AgentEvent[] = []
         if (evt.status === 'starting' && evt.attempt != null && evt.maxAttempts != null) {
@@ -641,11 +642,11 @@ export function useGlobalAgentListeners(): void {
         const legacyEvents = payloadToLegacyEvents(payload)
 
         for (const event of legacyEvents) {
-          // 会话首次进入 running 时，从 Working Done 集合移除（它会出现在 Running 组）
+          // 会话首次进入 running 时，清除旧的完成提醒状态
           if (event.type !== 'prompt_suggestion') {
             const prevState = store.get(agentStreamingStatesAtom).get(sessionId)
             if (!prevState || !prevState.running) {
-              store.set(workingDoneSessionIdsAtom, (prev: Set<string>) => {
+              store.set(unviewedCompletedSessionIdsAtom, (prev: Set<string>) => {
                 if (!prev.has(sessionId)) return prev
                 const next = new Set(prev)
                 next.delete(sessionId)
@@ -895,6 +896,15 @@ export function useGlobalAgentListeners(): void {
             store.set(agentPlanModeSessionsAtom, (prev: Set<string>) =>
               updatePlanModeSessionSet(prev, sessionId, event.mode === 'plan')
             )
+          } else if (event.type === 'run_resumed') {
+            // 后台任务完成自动唤醒：从"空闲可输入"恢复到"运行中"。
+            store.set(agentStreamingStatesAtom, (prev) => {
+              const current = prev.get(sessionId)
+              if (!current || current.running) return prev
+              const map = new Map(prev)
+              map.set(sessionId, { ...current, running: true })
+              return map
+            })
           }
         }
         }) // unstable_batchedUpdates
@@ -906,22 +916,28 @@ export function useGlobalAgentListeners(): void {
       (data: AgentStreamCompletePayload) => {
         console.log(`[FLASH-DEBUG] STREAM_COMPLETE for session=${data.sessionId.slice(0, 8)}, stoppedByUser=${data.stoppedByUser}, resultSubtype=${data.resultSubtype}`)
         unstable_batchedUpdates(() => {
+        // 后台任务等待态：turn 主体结束但仍有后台任务在飞行，UI 进入"空闲可输入"。
+        // 不发"任务已完成"通知（任务并未真正完成）、不清后台任务列表、不重载消息——
+        // 等后台任务完成时 Agent 会自动唤醒续轮。
+        const backgroundTasksPending = data.backgroundTasksPending === true
         // 发送桌面通知（任务完成，始终播放提示音）
         const enabled = store.get(notificationsEnabledAtom)
         const soundEnabled = store.get(notificationSoundEnabledAtom)
         const sounds = store.get(notificationSoundsAtom)
         const sessionTitle = getSessionTitle(data.sessionId)
-        sendDesktopNotification(
-          'Agent 任务完成',
-          `[${sessionTitle}] 任务已完成`,
-          enabled,
-          {
-            playSound: enabled && soundEnabled,
-            soundType: 'taskComplete',
-            sounds,
-            onNavigate: makeNavigateToSession(data.sessionId, sessionTitle),
-          }
-        )
+        if (!backgroundTasksPending) {
+          sendDesktopNotification(
+            'Agent 任务完成',
+            `[${sessionTitle}] 任务已完成`,
+            enabled,
+            {
+              playSound: enabled && soundEnabled,
+              soundType: 'taskComplete',
+              sounds,
+              onNavigate: makeNavigateToSession(data.sessionId, sessionTitle),
+            }
+          )
+        }
 
         // STREAM_COMPLETE 表示后端已完全结束 — 立即标记 running: false
         // 同时将所有未完成的工具活动标记为已完成，防止 subagent spinner 继续转动
@@ -929,7 +945,10 @@ export function useGlobalAgentListeners(): void {
         // 竞态保护：通过 startedAt 区分新旧流，防止旧流的 complete 事件重置新流的 running 状态
         store.set(agentStreamingStatesAtom, (prev) => {
           const current = prev.get(data.sessionId)
-          if (!current || !current.running) {
+          // 既非运行中、也非软空闲态 → 已彻底结束，忽略重复/陈旧的完成事件。
+          // 软空闲态（running=false 但 backgroundWaiting=true）也要处理：空闲超时/用户停止
+          // 触发的真正完成会带 backgroundTasksPending=false，需借此清除 backgroundWaiting。
+          if (!current || (!current.running && !current.backgroundWaiting)) {
             return prev
           }
           if (current.startedAt != null && (data.startedAt == null || current.startedAt > data.startedAt)) {
@@ -939,12 +958,14 @@ export function useGlobalAgentListeners(): void {
           map.set(data.sessionId, {
             ...current,
             running: false,
+            // backgroundTasksPending=true → 进入/保持软空闲态（通道仍开着，handleSend 走注入路径）；
+            // false → 真正结束，清除软空闲态，新消息回到新建 run 路径。
+            backgroundWaiting: backgroundTasksPending,
             ...finalizeStreamingActivities(current.toolActivities),
           })
           return map
         })
 
-        // 当前激活会话完成后仍保留在 Working Done，等待用户用对勾明确确认。
         // 只有未激活会话才进入"未查看完成"，避免当前页面完成时出现额外未读提醒。
         const currentSessionId = store.get(currentAgentSessionIdAtom)
         const completionMarkers = getAgentCompletionMarkers({
@@ -954,16 +975,8 @@ export function useGlobalAgentListeners(): void {
           sessionId: data.sessionId,
           documentHasFocus: document.hasFocus(),
         })
-        if (completionMarkers.markUnviewedCompleted) {
+        if (completionMarkers.markUnviewedCompleted && !backgroundTasksPending) {
           store.set(unviewedCompletedSessionIdsAtom, (prev: Set<string>) => {
-            const next = new Set(prev)
-            next.add(data.sessionId)
-            return next
-          })
-        }
-
-        if (completionMarkers.keepInWorkingDone) {
-          store.set(workingDoneSessionIdsAtom, (prev: Set<string>) => {
             const next = new Set(prev)
             next.add(data.sessionId)
             return next
@@ -1016,6 +1029,10 @@ export function useGlobalAgentListeners(): void {
         const finalize = (): void => {
           // 竞态保护：新流已启动时不要清理状态
           if (isNewStreamRunning()) return
+
+          // 后台任务等待态：保留后台任务列表（面板继续显示在跑任务），不做收尾清理，
+          // 等任务完成 Agent 自动唤醒续轮后再走真正的完成路径。
+          if (backgroundTasksPending) return
 
           // 清理后台任务
           store.set(backgroundTasksAtomFamily(data.sessionId), [])

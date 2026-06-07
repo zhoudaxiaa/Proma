@@ -78,6 +78,8 @@ interface ModelSelectorProps {
   externalSelectedModel?: { channelId: string; modelId: string } | null
   /** 外部选择回调 */
   onModelSelect?: (option: ModelOption) => void
+  /** 触发按钮是否显示「渠道 · 模型」（默认只显示模型名） */
+  showChannelInTrigger?: boolean
 }
 
 export function ModelSelector({
@@ -85,6 +87,7 @@ export function ModelSelector({
   filterChannelIds,
   externalSelectedModel,
   onModelSelect,
+  showChannelInTrigger = false,
 }: ModelSelectorProps = {}): React.ReactElement {
   const [conversationModel, setConversationModel] = useConversationModelOptional()
   const conversationId = useConversationIdOptional()
@@ -241,7 +244,9 @@ export function ModelSelector({
           <Cpu className="size-3.5" />
         )}
         <span className="max-w-[200px] truncate">
-          {displayModelInfo ? displayModelInfo.modelName : '选择模型'}
+          {displayModelInfo
+            ? (showChannelInTrigger ? `${displayModelInfo.channelName} · ${displayModelInfo.modelName}` : displayModelInfo.modelName)
+            : '选择模型'}
         </span>
         <ChevronDown className="size-3" />
       </button>
@@ -268,7 +273,7 @@ export function ModelSelector({
           </div>
 
           {/* 模型列表 */}
-          <div className="max-h-[420px] overflow-y-auto">
+          <div className="max-h-[420px] overflow-y-auto scrollbar-thin">
             {filteredGrouped.size === 0 ? (
               <div className="py-10 text-center text-sm text-muted-foreground">
                 未找到模型

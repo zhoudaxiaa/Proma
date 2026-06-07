@@ -302,7 +302,7 @@ function DisplayOptionsPopover({
 
 export function AgentView({ sessionId }: { sessionId: string }): React.ReactElement {
   const [persistedSDKMessages, setPersistedSDKMessages] = React.useState<SDKMessage[]>([])
-  const persistedSDKMessagesRef = React.useRef<SDKMessage[]>(EMPTY_SDK_MESSAGES)
+  const persistedSDKMessagesRef = React.useRef<SDKMessage[]>([])
   persistedSDKMessagesRef.current = persistedSDKMessages
   const setStreamingStates = useSetAtom(agentStreamingStatesAtom)
   // 按 sessionId 切片订阅：仅本 session 的 streaming state 变化才让 AgentView 重渲染。
@@ -310,6 +310,9 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   // atom 输出引用未变，订阅者跳过通知。
   const streamState = useAtomValue(agentSessionStreamingStateAtomFamily(sessionId))
   const streaming = streamState?.running ?? false
+  // 软空闲态：本轮主体已结束、UI 可输入，但 SDK 通道仍开着等后台任务唤醒。
+  // 此时服务端 activeSessions 仍保留，新消息须走注入通道而非新建 run。
+  const backgroundWaiting = streamState?.backgroundWaiting ?? false
   const stoppedByUserSessions = useAtomValue(stoppedByUserSessionsAtom)
   const sendWithCmdEnter = useAtomValue(sendWithCmdEnterAtom)
   const stoppedByUser = stoppedByUserSessions.has(sessionId)
@@ -667,12 +670,16 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           // 注意：保留 inputTokens/contextWindow 以维持上下文用量圆环显示
           setStreamingStates((prev) => {
             const state = prev.get(sessionId)
-            if (!state || state.running) return prev  // 仍在运行中，不清除
+            // 仍在运行中：不清除
+            if (!state || state.running) return prev
             const map = new Map(prev)
+            // 软空闲态（后台任务等待）：必须保留 backgroundWaiting 标志（否则 handleSend 误走新建 run），
+            // 但展示字段 content/toolActivities 仍要清空——否则上一轮流式文本残留会被兜底气泡渲染成重复消息。
             if (state.inputTokens !== undefined) {
               // 保留 usage 数据，仅清除流式展示字段
               map.set(sessionId, {
                 running: false,
+                backgroundWaiting: state.backgroundWaiting,
                 content: '',
                 toolActivities: [],
                 inputTokens: state.inputTokens,
@@ -681,6 +688,14 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
                 cacheCreationTokens: state.cacheCreationTokens,
                 contextWindow: state.contextWindow,
                 model: state.model,
+              })
+            } else if (state.backgroundWaiting) {
+              // 无 usage 数据但处于软空闲：保留标志，清空展示字段
+              map.set(sessionId, {
+                running: false,
+                backgroundWaiting: true,
+                content: '',
+                toolActivities: [],
               })
             } else {
               map.delete(sessionId)
@@ -698,7 +713,11 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           })
         })
       })
-      .catch(console.error)
+      .catch((error) => {
+        if (cancelled) return
+        console.error(error)
+        setMessagesLoaded(true)
+      })
     return () => { cancelled = true }
   }, [sessionId, refreshVersion, setStreamingStates, setLiveMessagesMap, setMessagesCache, store])
 
@@ -1218,14 +1237,17 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     // 如果输入为空但有建议，使用建议内容
     const effectiveText = text || suggestion || ''
     const pendingFilesSnapshot = pendingFilesRef.current
-    if ((!effectiveText && pendingFilesSnapshot.length === 0) || !agentChannelId || !hasAvailableModel) return
+    if (!messagesLoaded || (!effectiveText && pendingFilesSnapshot.length === 0) || !agentChannelId || !hasAvailableModel) return
     const additionalDirectoriesForRun = new Set(attachedDirs)
     for (const dir of attachedFileDirectories) {
       additionalDirectoriesForRun.add(dir)
     }
 
-    // 上一条消息仍在处理中，直接追加发送
-    if (streaming) {
+    // 上一条消息仍在处理中（streaming），或后台任务等待态（backgroundWaiting，通道仍开着）：
+    // 都走注入通道而非新建 run，避免被服务端并发守卫拒绝。
+    // - streaming：本轮真正进行中，注入时需先软中断当前 turn
+    // - backgroundWaiting：软空闲、无活跃 turn，直接注入即可，无需中断
+    if (streaming || backgroundWaiting) {
       // 流式追加时不处理附件（仅支持纯文本）
       if (pendingFilesSnapshot.length > 0) {
         toast.info('Agent 运行中暂不支持追加发送附件', {
@@ -1264,12 +1286,14 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         return map
       })
 
-      // 3. 异步发送到后端（立即软中断当前 turn，再注入消息作为新一轮输入）
+      // 3. 异步发送到后端，注入消息作为新一轮输入。
+      //    - streaming（本轮真正进行中）：先软中断当前 turn 再注入
+      //    - backgroundWaiting（软空闲，无活跃 turn）：直接注入，无需中断
       window.electronAPI.queueAgentMessage({
         sessionId,
         userMessage: effectiveText,
         uuid: localUuid,
-        interrupt: true,
+        interrupt: streaming,
       }).catch((error) => {
         console.error('[AgentView] 追加消息失败:', error)
         toast.error('追加消息失败', { description: String(error) })
@@ -1514,7 +1538,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         return map
       })
     })
-  }, [inputContent, attachedDirs, attachedFileDirectories, sessionId, agentChannelId, agentModelId, currentWorkspaceId, workspaces, streaming, suggestion, hasAvailableModel, store, setStreamingStates, setPendingFiles, setAgentStreamErrors, setPromptSuggestions, setInputContent, setLiveMessagesMap, permissionMode])
+  }, [inputContent, attachedDirs, attachedFileDirectories, sessionId, agentChannelId, agentModelId, currentWorkspaceId, workspaces, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, setStreamingStates, setPendingFiles, setAgentStreamErrors, setPromptSuggestions, setInputContent, setLiveMessagesMap, permissionMode, messagesLoaded])
 
   /** 停止生成 */
   const handleStop = React.useCallback((): void => {
@@ -1829,7 +1853,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   }, [togglePreviewPanel])
 
   const hasTextInput = inputContent.trim().length > 0
-  const canSend = (hasTextInput || pendingFiles.length > 0 || !!suggestion) && agentChannelId !== null && hasAvailableModel && (!streaming || hasTextInput)
+  const canSend = messagesLoaded && (hasTextInput || pendingFiles.length > 0 || !!suggestion) && agentChannelId !== null && hasAvailableModel && (!streaming || hasTextInput)
 
   const inputToolbarItems = React.useMemo<ToolbarItem[]>(() => [
     {
@@ -2016,6 +2040,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
 
         {/* AskUserQuestion 交互式问答横幅 */}
         <AskUserBanner sessionId={sessionId} />
+
 
         {/* ExitPlanMode 计划审批横幅 */}
         <ExitPlanModeBanner sessionId={sessionId} />
