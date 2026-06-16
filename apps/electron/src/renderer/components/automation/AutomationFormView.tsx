@@ -12,6 +12,8 @@ import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
 import { toast } from 'sonner'
 import { AlertTriangle, ArrowLeft, Bell, Check, Clock, Loader2, Pencil, Play, Settings, X } from 'lucide-react'
+import { detectIsWindows } from '@/lib/platform'
+import { cn } from '@/lib/utils'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import {
@@ -22,6 +24,7 @@ import {
   SelectItem,
 } from '@/components/ui/select'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
+import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover'
 import { ModelSelector } from '@/components/chat/ModelSelector'
 import {
   automationFormAtom,
@@ -31,7 +34,7 @@ import {
   automationToDraft,
   type AutomationDraft,
 } from '@/atoms/automation-atoms'
-import { agentWorkspacesAtom, agentSessionsAtom, agentChannelIdsAtom } from '@/atoms/agent-atoms'
+import { agentWorkspacesAtom, agentSessionsAtom, agentChannelIdsAtom, currentAgentWorkspaceIdAtom } from '@/atoms/agent-atoms'
 import { activeSessionIdAtom } from '@/atoms/tab-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
 import { settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
@@ -46,7 +49,6 @@ import type {
   UpdateAutomationInput,
 } from '@proma/shared'
 
-const NO_WORKSPACE = '__none__'
 const NO_FEISHU_BINDING = '__none__'
 
 function formatTime(ts?: number): string {
@@ -61,7 +63,23 @@ function formatRunStatus(status: AutomationRun['status']): string {
 }
 
 function canPersistDraft(draft: AutomationDraft): boolean {
-  return !!(draft.name.trim() && draft.prompt.trim() && draft.channelId)
+  // 草稿保存门槛：只要有任务名和任务描述就保存为草稿（缺 channelId / workspaceId 会被强制不启用）
+  return !!(draft.name.trim() && draft.prompt.trim())
+}
+
+/** 任务是否具备运行 / 启用所需的最小完整度（模型 + 工作区） */
+function isReadyToRun(draft: AutomationDraft): boolean {
+  return canPersistDraft(draft) && !!draft.channelId && !!draft.workspaceId
+}
+
+/** 列出当前还缺哪些必填项（用于"运行一次" Tooltip 与关闭时的 toast 提示） */
+function listMissingFields(draft: AutomationDraft): string[] {
+  const missing: string[] = []
+  if (!draft.name.trim()) missing.push('任务名称')
+  if (!draft.prompt.trim()) missing.push('任务描述')
+  if (!draft.channelId) missing.push('模型')
+  if (!draft.workspaceId) missing.push('工作区')
+  return missing
 }
 
 function getDraftSignature(draft: AutomationDraft): string {
@@ -73,10 +91,12 @@ function getDraftSignature(draft: AutomationDraft): string {
     intervalMinutes: draft.intervalMinutes,
     timeOfDay: draft.timeOfDay ?? '',
     dayOfWeek: draft.dayOfWeek ?? '',
+    dayOfMonth: draft.dayOfMonth ?? '',
     channelId: draft.channelId,
     modelId: draft.modelId ?? '',
     workspaceId: draft.workspaceId ?? '',
     permissionMode: draft.permissionMode,
+    sessionMode: draft.sessionMode,
     notificationTargets: draft.notificationTargets ?? [],
     active: draft.active,
   })
@@ -90,10 +110,12 @@ function draftToCreateInput(draft: AutomationDraft): CreateAutomationInput {
     intervalMinutes: draft.intervalMinutes,
     timeOfDay: draft.timeOfDay,
     dayOfWeek: draft.dayOfWeek,
+    dayOfMonth: draft.dayOfMonth,
     channelId: draft.channelId,
     modelId: draft.modelId,
     workspaceId: draft.workspaceId,
     permissionMode: draft.permissionMode,
+    sessionMode: draft.sessionMode,
     notificationTargets: draft.notificationTargets,
     sourceSessionId: draft.sourceSessionId,
     active: draft.active,
@@ -109,10 +131,12 @@ function draftToUpdateInput(draft: AutomationDraft): UpdateAutomationInput {
     intervalMinutes: draft.intervalMinutes,
     timeOfDay: draft.timeOfDay,
     dayOfWeek: draft.dayOfWeek,
+    dayOfMonth: draft.dayOfMonth,
     channelId: draft.channelId,
     modelId: draft.modelId,
     workspaceId: draft.workspaceId ?? '',
     permissionMode: draft.permissionMode,
+    sessionMode: draft.sessionMode,
     notificationTargets: draft.notificationTargets ?? [],
     active: draft.active,
   }
@@ -165,7 +189,57 @@ function AutomationPromptEmptyGuide(): React.ReactElement {
   )
 }
 
+type SaveStatus = 'idle' | 'dirty' | 'saving' | 'saved' | 'error'
+
+function SaveStatusBadge({
+  status,
+  lastSavedAt,
+}: {
+  status: SaveStatus
+  lastSavedAt: number | null
+}): React.ReactElement | null {
+  if (status === 'idle' && !lastSavedAt) return null
+
+  let icon: React.ReactNode
+  let text: string
+  let tone = 'text-muted-foreground'
+
+  if (status === 'dirty') {
+    icon = <span className="size-1.5 rounded-full bg-muted-foreground/50" />
+    text = '未保存'
+  } else if (status === 'saving') {
+    icon = <Loader2 className="size-3 animate-spin" />
+    text = '保存中…'
+  } else if (status === 'saved') {
+    icon = <Check className="size-3 text-emerald-500" />
+    text = '已保存 · 刚刚'
+    tone = 'text-foreground/70'
+  } else if (status === 'error') {
+    icon = <AlertTriangle className="size-3" />
+    text = '保存失败'
+    tone = 'text-red-500'
+  } else {
+    icon = <Check className="size-3 text-muted-foreground/50" />
+    text = '已保存'
+  }
+
+  return (
+    <div
+      className={cn(
+        'titlebar-no-drag flex items-center gap-1.5 text-[11px] flex-shrink-0 tabular-nums select-none',
+        tone,
+      )}
+      aria-live="polite"
+      role="status"
+    >
+      {icon}
+      <span>{text}</span>
+    </div>
+  )
+}
+
 export function AutomationFormView(): React.ReactElement | null {
+  const isWindows = React.useMemo(() => detectIsWindows(), [])
   const [formState, setFormState] = useAtom(automationFormAtom)
   const setAutomations = useSetAtom(automationsAtom)
   const workspaces = useAtomValue(agentWorkspacesAtom)
@@ -173,6 +247,7 @@ export function AutomationFormView(): React.ReactElement | null {
   const agentChannelIds = useAtomValue(agentChannelIdsAtom)
   const [agentSessions, setAgentSessions] = useAtom(agentSessionsAtom)
   const activeSessionId = useAtomValue(activeSessionIdAtom)
+  const currentAgentWorkspaceId = useAtomValue(currentAgentWorkspaceIdAtom)
   const setActiveView = useSetAtom(activeViewAtom)
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
   const setSettingsTab = useSetAtom(settingsTabAtom)
@@ -182,6 +257,8 @@ export function AutomationFormView(): React.ReactElement | null {
   const [editingName, setEditingName] = React.useState(false)
   const [runningNow, setRunningNow] = React.useState(false)
   const [feishuBindings, setFeishuBindings] = React.useState<FeishuChatBinding[]>([])
+  const [saveStatus, setSaveStatus] = React.useState<SaveStatus>('idle')
+  const [lastSavedAt, setLastSavedAt] = React.useState<number | null>(null)
   const nameInputRef = React.useRef<HTMLInputElement>(null)
   const saveTimerRef = React.useRef<number | undefined>(undefined)
   const lastSavedSignatureRef = React.useRef('')
@@ -202,8 +279,22 @@ export function AutomationFormView(): React.ReactElement | null {
       lastSavedSignatureRef.current = formState.draft.id && canPersistDraft(formState.draft)
         ? getDraftSignature(formState.draft)
         : ''
+      setSaveStatus('idle')
+      setLastSavedAt(null)
     }
   }, [formState.open, formState.draft])
+
+  // 新建模式下若 workspaceId 为空，按优先级填入默认值：
+  // 1. 当前 Agent 模式选中的工作区（≈ 当前会话所在工作区）
+  // 2. 第一个工作区（fallback）
+  // 编辑模式不动；用户已显式选过的也不覆盖。
+  React.useEffect(() => {
+    if (!formState.open || !form || form.id || form.workspaceId) return
+    const fallback = currentAgentWorkspaceId ?? workspaces[0]?.id
+    if (fallback) {
+      setForm((prev) => (prev && !prev.id && !prev.workspaceId ? { ...prev, workspaceId: fallback } : prev))
+    }
+  }, [formState.open, form?.id, form?.workspaceId, currentAgentWorkspaceId, workspaces])
 
   React.useEffect(() => {
     if (!formState.open) return
@@ -239,9 +330,14 @@ export function AutomationFormView(): React.ReactElement | null {
     const persistTask = (async (): Promise<string | null> => {
       const previousId = previousPersist ? await previousPersist.catch(() => null) : null
       const latestDraft = latestFormRef.current
-      const draftToSave = latestDraft
+      const baseDraft = latestDraft
         ? { ...latestDraft, id: latestDraft.id ?? previousId ?? draft.id }
         : { ...draft, id: draft.id ?? previousId ?? undefined }
+
+      // 不完整任务（缺模型 / 工作区）强制不启用：避免无配置任务出现在「启用中」分组
+      const draftToSave: AutomationDraft = isReadyToRun(baseDraft)
+        ? baseDraft
+        : { ...baseDraft, active: false }
 
       if (!canPersistDraft(draftToSave)) return draftToSave.id ?? null
 
@@ -249,12 +345,17 @@ export function AutomationFormView(): React.ReactElement | null {
       if (signature === lastSavedSignatureRef.current) return draftToSave.id ?? null
 
       try {
+        if (isMountedRef.current) setSaveStatus('saving')
         if (draftToSave.id) {
           const updated = await window.electronAPI.updateAutomation(draftToUpdateInput(draftToSave))
           if (!updated) throw new Error('定时任务不存在')
           lastSavedSignatureRef.current = signature
           setAutomations((prev) => prev.map((a) => (a.id === updated.id ? updated : a)))
           setForm((prev) => (prev ? { ...prev, id: updated.id, name: updated.name } : prev))
+          if (isMountedRef.current) {
+            setSaveStatus('saved')
+            setLastSavedAt(Date.now())
+          }
           return updated.id
         } else {
           const created = await window.electronAPI.createAutomation(draftToCreateInput(draftToSave))
@@ -262,11 +363,18 @@ export function AutomationFormView(): React.ReactElement | null {
           lastSavedSignatureRef.current = getDraftSignature(createdDraft)
           setAutomations((prev) => [created, ...prev.filter((a) => a.id !== created.id)])
           setForm((prev) => (prev ? { ...prev, id: created.id, name: created.name } : prev))
+          if (isMountedRef.current) {
+            setSaveStatus('saved')
+            setLastSavedAt(Date.now())
+          }
           return created.id
         }
       } catch (err) {
         console.error('[定时任务] 自动保存失败:', err)
-        if (isMountedRef.current) toast.error('自动保存失败')
+        if (isMountedRef.current) {
+          setSaveStatus('error')
+          toast.error('自动保存失败')
+        }
         return null
       }
     })()
@@ -284,7 +392,13 @@ export function AutomationFormView(): React.ReactElement | null {
     if (!formState.open || !form || !canPersistDraft(form)) return
 
     const signature = getDraftSignature(form)
-    if (signature === lastSavedSignatureRef.current) return
+    if (signature === lastSavedSignatureRef.current) {
+      // 用户撤回到上次保存的状态，清掉残留的 dirty
+      setSaveStatus((prev) => (prev === 'dirty' ? 'idle' : prev))
+      return
+    }
+
+    setSaveStatus('dirty')
 
     if (saveTimerRef.current !== undefined) {
       window.clearTimeout(saveTimerRef.current)
@@ -300,6 +414,13 @@ export function AutomationFormView(): React.ReactElement | null {
       }
     }
   }, [form, formState.open, persistDraft])
+
+  // "已保存 · 刚刚" 高亮 3 秒后退化为静态"已保存"，避免一直占用视觉焦点
+  React.useEffect(() => {
+    if (saveStatus !== 'saved') return
+    const timer = window.setTimeout(() => setSaveStatus('idle'), 3000)
+    return () => window.clearTimeout(timer)
+  }, [saveStatus])
 
   // 切换会话/Tab 时自动关闭表单
   const initialSessionRef = React.useRef<string | null | undefined>(undefined)
@@ -318,6 +439,8 @@ export function AutomationFormView(): React.ReactElement | null {
       setFormState({ open: false, draft: null })
     }
   }, [activeSessionId, formState.open, persistDraft, setFormState])
+
+  const [dayPopoverOpen, setDayPopoverOpen] = React.useState(false)
 
   if (!formState.open || !form) return null
 
@@ -339,8 +462,9 @@ export function AutomationFormView(): React.ReactElement | null {
 
   const handleRunNow = async (): Promise<void> => {
     const latest = latestFormRef.current
-    if (!latest || !canPersistDraft(latest)) {
-      toast.error('请先填写任务名称、任务描述并选择模型')
+    if (!latest || !isReadyToRun(latest)) {
+      const missing = latest ? listMissingFields(latest) : ['任务名称', '任务描述', '模型', '工作区']
+      toast.error(`请先补全：${missing.join('、')}`)
       return
     }
 
@@ -479,6 +603,7 @@ export function AutomationFormView(): React.ReactElement | null {
               </button>
             </div>
           )}
+          <SaveStatusBadge status={saveStatus} lastSavedAt={lastSavedAt} />
         </div>
         <div className="flex-1 min-h-0 px-6 pb-6 flex flex-col gap-3">
           <div className="flex items-center">
@@ -511,34 +636,50 @@ export function AutomationFormView(): React.ReactElement | null {
         <div className="flex items-center justify-between gap-2 px-4 py-4 flex-shrink-0">
           <span className="text-sm font-semibold text-foreground">配置</span>
           <div className="flex items-center gap-1">
-            <button
-              type="button"
-              onClick={() => { void handleRunNow() }}
-              disabled={runningNow || !canPersistDraft(form)}
-              className="titlebar-no-drag h-7 px-2.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-sm"
-            >
-              {runningNow ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
-              <span>{runningNow ? '运行中' : '运行一次'}</span>
-            </button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span>
+                  <button
+                    type="button"
+                    onClick={() => { void handleRunNow() }}
+                    disabled={runningNow || !isReadyToRun(form)}
+                    className="titlebar-no-drag h-7 px-2.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-sm"
+                  >
+                    {runningNow ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
+                    <span>{runningNow ? '运行中' : '运行一次'}</span>
+                  </button>
+                </span>
+              </TooltipTrigger>
+              {!isReadyToRun(form) && !runningNow && (
+                <TooltipContent side="bottom">
+                  请先补全：{listMissingFields(form).join('、')}
+                </TooltipContent>
+              )}
+            </Tooltip>
+            {!isWindows && (
             <button
               onClick={close}
               className="titlebar-no-drag p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-foreground/[0.06] transition-colors"
             >
               <X className="size-4" />
             </button>
+          )}
           </div>
         </div>
 
         <div className="flex-1 overflow-y-auto px-4 pb-4 flex flex-col gap-5">
-          {/* 启用开关（最上） */}
+          {/* 启用开关（最上）：模型 / 工作区缺失时禁用，避免 UI 状态与持久化结果不一致 */}
           <div className="flex items-center justify-between">
             <div className="flex flex-col gap-0.5">
               <Label htmlFor="auto-active">启用</Label>
-              <span className="text-xs text-muted-foreground">关闭后任务暂停调度</span>
+              <span className="text-xs text-muted-foreground">
+                {isReadyToRun(form) ? '关闭后任务暂停调度' : `补全${listMissingFields(form).join('、')}后方可启用`}
+              </span>
             </div>
             <Switch
               id="auto-active"
-              checked={form.active}
+              checked={form.active && isReadyToRun(form)}
+              disabled={!isReadyToRun(form)}
               onCheckedChange={(checked) => update({ active: checked })}
             />
           </div>
@@ -561,7 +702,7 @@ export function AutomationFormView(): React.ReactElement | null {
 
           {/* 调度模式 */}
           <div className="flex flex-col gap-2">
-            <Label>运行方式</Label>
+            <Label>运行频率</Label>
             <Select
               value={form.scheduleType}
               onValueChange={(v) => update({ scheduleType: v as AutomationDraft['scheduleType'] })}
@@ -571,6 +712,7 @@ export function AutomationFormView(): React.ReactElement | null {
                 <SelectItem value="interval">每隔一段时间</SelectItem>
                 <SelectItem value="daily">每天定点</SelectItem>
                 <SelectItem value="weekly">每周定点</SelectItem>
+                <SelectItem value="monthly">每月定点</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -633,6 +775,64 @@ export function AutomationFormView(): React.ReactElement | null {
             </div>
           )}
 
+          {/* monthly 模式：日期网格 + 时刻 */}
+          {form.scheduleType === 'monthly' && (
+            <div className="flex flex-col gap-2">
+              <Label>每月</Label>
+              <div className="flex items-center gap-2">
+                <Popover open={dayPopoverOpen} onOpenChange={setDayPopoverOpen}>
+                  <PopoverTrigger asChild>
+                    <button
+                      type="button"
+                      className="flex h-9 flex-1 items-center justify-between rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm hover:bg-foreground/[0.02] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    >
+                      <span>{form.dayOfMonth ?? 1} 号</span>
+                    </button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-56 p-2" align="start">
+                    <div className="grid grid-cols-7 gap-0.5">
+                      {['一', '二', '三', '四', '五', '六', '日'].map((d) => (
+                        <div key={d} className="flex h-7 items-center justify-center text-[11px] font-medium text-muted-foreground">
+                          {d}
+                        </div>
+                      ))}
+                      {Array.from({ length: 31 }, (_, i) => {
+                        const day = i + 1
+                        const selected = (form.dayOfMonth ?? 1) === day
+                        return (
+                          <button
+                            key={day}
+                            type="button"
+                            onClick={() => { update({ dayOfMonth: day }); setDayPopoverOpen(false) }}
+                            className={cn(
+                              'flex h-7 items-center justify-center rounded-md text-[13px] transition-colors',
+                              selected
+                                ? 'bg-primary text-primary-foreground'
+                                : 'text-foreground hover:bg-foreground/[0.06]',
+                            )}
+                          >
+                            {day}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </PopoverContent>
+                </Popover>
+                <input
+                  type="time"
+                  value={form.timeOfDay ?? '09:00'}
+                  onChange={(e) => update({ timeOfDay: e.target.value })}
+                  className="flex h-9 w-[120px] shrink-0 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                />
+              </div>
+              {form.dayOfMonth !== undefined && form.dayOfMonth >= 29 && (
+                <span className="pl-2.5 text-xs text-muted-foreground leading-relaxed">
+                  如当月无 {form.dayOfMonth} 日，将在当月最后一天执行
+                </span>
+              )}
+            </div>
+          )}
+
           {/* 选择模型（定时任务只能跑 Agent，因此只显示已勾选为 Agent 兼容的渠道模型） */}
           <div className="flex flex-col gap-2">
             <Label>选择模型</Label>
@@ -661,21 +861,37 @@ export function AutomationFormView(): React.ReactElement | null {
             )}
           </div>
 
-          {/* 工作区 */}
+          {/* 工作区（必选，默认填入当前会话所在工作区） */}
           <div className="flex flex-col gap-2">
             <Label>工作区</Label>
-            <Select
-              value={form.workspaceId ?? NO_WORKSPACE}
-              onValueChange={(v) => update({ workspaceId: v === NO_WORKSPACE ? undefined : v })}
-            >
-              <SelectTrigger><SelectValue placeholder="选择工作区" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value={NO_WORKSPACE}>无工作区</SelectItem>
-                {workspaces.map((ws) => (
-                  <SelectItem key={ws.id} value={ws.id}>{ws.name}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {workspaces.length === 0 ? (
+              <div className="flex items-center gap-2 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
+                <Settings size={14} className="shrink-0" />
+                <span>尚未创建任何工作区</span>
+                <button
+                  type="button"
+                  className="ml-auto text-xs underline underline-offset-2 hover:text-foreground transition-colors"
+                  onClick={() => {
+                    setSettingsTab('agent')
+                    setSettingsOpen(true)
+                  }}
+                >
+                  前往 Agent 设置
+                </button>
+              </div>
+            ) : (
+              <Select
+                value={form.workspaceId ?? ''}
+                onValueChange={(v) => update({ workspaceId: v })}
+              >
+                <SelectTrigger><SelectValue placeholder="选择工作区" /></SelectTrigger>
+                <SelectContent>
+                  {workspaces.map((ws) => (
+                    <SelectItem key={ws.id} value={ws.id}>{ws.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
           </div>
 
           {/* 飞书通知 */}
@@ -755,6 +971,9 @@ export function AutomationFormView(): React.ReactElement | null {
             )}
           </div>
 
+          {/* 会话模式选择已隐藏：默认采用 daily（同日复用、跨日新建）。
+              schema/scheduler/Agent 工具层仍保留 reuse 模式，方便老配置和高级用户继续使用。 */}
+
           {/* 权限模式 */}
           <div className="flex flex-col gap-2">
             <Label>运行权限</Label>
@@ -821,6 +1040,18 @@ export function AutomationFormView(): React.ReactElement | null {
               )}
             </div>
           )}
+        </div>
+        {/* 底部运行测试按钮 */}
+        <div className="flex-shrink-0 px-4 py-3 border-t border-border/50 bg-content-area">
+          <button
+            type="button"
+            onClick={() => { void handleRunNow() }}
+            disabled={runningNow || !canPersistDraft(form)}
+            className="titlebar-no-drag w-full h-8 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50 transition-colors flex items-center justify-center gap-1.5 shadow-sm"
+          >
+            {runningNow ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
+            <span>{runningNow ? '运行中' : '运行测试'}</span>
+          </button>
         </div>
       </div>
     </div>

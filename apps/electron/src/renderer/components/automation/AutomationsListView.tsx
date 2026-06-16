@@ -33,6 +33,12 @@ function formatSchedule(a: Automation): string {
     const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
     return `每${names[a.dayOfWeek ?? 1]} ${a.timeOfDay ?? '09:00'}`
   }
+  if (a.scheduleType === 'monthly') {
+    const dom = a.dayOfMonth ?? 1
+    // 29-31 号在短月会自动落在当月最后一天，列表里追加提示避免用户误以为漏跑
+    const suffix = dom >= 29 ? '（短月落在最后一天）' : ''
+    return `每月 ${dom} 号 ${a.timeOfDay ?? '09:00'}${suffix}`
+  }
   const min = a.intervalMinutes
   if (min < 60) return `每 ${min} 分钟`
   if (min < 1440) return `每 ${min / 60} 小时`
@@ -114,8 +120,16 @@ interface SectionProps {
 }
 
 function Section({ title, automations, onEdit, onRefresh, variant }: SectionProps): React.ReactElement {
+  /** 列表上的任务是否具备运行 / 启用所需的最小完整度 */
+  const isRunnable = (a: Automation): boolean => !!a.channelId && !!a.workspaceId
+
   const handleRunNow = async (e: React.MouseEvent, a: Automation): Promise<void> => {
     e.stopPropagation()
+    if (!isRunnable(a)) {
+      toast.error('请先为该任务配置模型与工作区')
+      onEdit(a)
+      return
+    }
     toast.success(`已开始运行「${a.name}」`, {
       description: '本次任务会创建新的 Agent 会话，可在左侧会话列表查看',
     })
@@ -129,6 +143,12 @@ function Section({ title, automations, onEdit, onRefresh, variant }: SectionProp
 
   const handleToggle = async (e: React.MouseEvent, a: Automation): Promise<void> => {
     e.stopPropagation()
+    // 启用前必须配齐模型与工作区，否则打开编辑面板让用户补全
+    if (!a.active && !isRunnable(a)) {
+      toast.error('请先为该任务配置模型与工作区')
+      onEdit(a)
+      return
+    }
     try {
       await window.electronAPI.toggleAutomation(a.id, !a.active)
       await onRefresh()

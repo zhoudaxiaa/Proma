@@ -113,7 +113,7 @@ import type {
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/runtime-init'
-import { getUnstagedChanges, getFileDiff, getUntrackedContent, revertFile, getDiffContents, listWorktrees, getWorktreeChanges } from './lib/git-diff-service'
+import { getUnstagedChanges, getFileDiff, getUntrackedContent, revertFile, getDiffContents, listWorktrees, getWorktreeChanges, getMainRepoRoot } from './lib/git-diff-service'
 import { registerPromaFilePath } from './lib/local-file-protocol'
 import { registerUpdaterIpc } from './lib/updater/updater-ipc'
 import {
@@ -353,6 +353,21 @@ function getAllowedCandidateBasePaths(options?: FileAccessOptions): string[] | u
 
 function ensurePathAllowed(filePath: string, options?: FileAccessOptions): boolean {
   if (isPathAllowed(filePath, options)) return true
+  console.warn('[IPC] 拒绝越界路径:', filePath)
+  return false
+}
+
+/**
+ * 在 ensurePathAllowed 基础上，额外放行「已授权仓库的 worktree」。
+ *
+ * worktree 常被放在主仓库之外（如 ~/proma-dev/worktrees/xxx），其路径不在任何
+ * 授权根下，会被 ensurePathAllowed 拒绝。但只要它回溯到的主仓库已被授权，就应放行。
+ * 用 git 自身背书（--git-common-dir），避免粗暴跳过安全检查。
+ */
+async function ensurePathAllowedWithWorktree(filePath: string, options?: FileAccessOptions): Promise<boolean> {
+  if (isPathAllowed(filePath, options)) return true
+  const mainRepo = await getMainRepoRoot(filePath)
+  if (mainRepo && isPathAllowed(mainRepo, options)) return true
   console.warn('[IPC] 拒绝越界路径:', filePath)
   return false
 }
@@ -794,7 +809,7 @@ export function registerIpcHandlers(): void {
         return ''
       }
       const access = normalizeFileAccessOptions({ sessionId })
-      if (!ensurePathAllowed(dirPath, access) || (gitRoot && !ensurePathAllowed(gitRoot, access))) return ''
+      if (!(await ensurePathAllowedWithWorktree(dirPath, access)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access)))) return ''
       return getFileDiff(dirPath, filePath, gitRoot)
     }
   )
@@ -809,7 +824,7 @@ export function registerIpcHandlers(): void {
         return ''
       }
       const access = normalizeFileAccessOptions({ sessionId })
-      if (!ensurePathAllowed(dirPath, access) || (gitRoot && !ensurePathAllowed(gitRoot, access))) return ''
+      if (!(await ensurePathAllowedWithWorktree(dirPath, access)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access)))) return ''
       return getUntrackedContent(dirPath, filePath, gitRoot)
     }
   )
@@ -824,7 +839,7 @@ export function registerIpcHandlers(): void {
         return
       }
       const access = normalizeFileAccessOptions({ sessionId })
-      if (!ensurePathAllowed(dirPath, access) || (gitRoot && !ensurePathAllowed(gitRoot, access))) return
+      if (!(await ensurePathAllowedWithWorktree(dirPath, access)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access)))) return
       await revertFile(dirPath, filePath, gitRoot)
     }
   )
@@ -839,7 +854,7 @@ export function registerIpcHandlers(): void {
         return null
       }
       const access = normalizeFileAccessOptions({ sessionId })
-      if (!ensurePathAllowed(dirPath, access) || (gitRoot && !ensurePathAllowed(gitRoot, access))) return null
+      if (!(await ensurePathAllowedWithWorktree(dirPath, access)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access)))) return null
       return getDiffContents(dirPath, filePath, gitRoot, input.baseRef)
     }
   )
@@ -861,7 +876,7 @@ export function registerIpcHandlers(): void {
         return { isGitRepo: false, files: [], untrackedFiles: [], gitRootNames: [] }
       }
       const access = normalizeFileAccessOptions({ sessionId })
-      if (!ensurePathAllowed(worktreePath, access)) {
+      if (!(await ensurePathAllowedWithWorktree(worktreePath, access))) {
         return { isGitRepo: false, files: [], untrackedFiles: [], gitRootNames: [] }
       }
       return getWorktreeChanges(worktreePath, baseBranch)
@@ -2588,7 +2603,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.GET_WORKTREE_REPOS,
     async (_, workspaceSlug: string) => {
-      return getWorktreeRepos(workspaceSlug)
+      return await getWorktreeRepos(workspaceSlug)
     }
   )
 
@@ -2622,7 +2637,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.LIST_DIRECTORY,
     async (_, dirPath: string): Promise<FileEntry[]> => {
-      const { readdirSync, statSync } = await import('node:fs')
+      const { existsSync, readdirSync, statSync } = await import('node:fs')
       const { resolve } = await import('node:path')
 
       // 安全校验：路径必须在 agent-workspaces 目录下
@@ -2630,6 +2645,11 @@ export function registerIpcHandlers(): void {
       const workspacesRoot = resolve(getAgentWorkspacesDir())
       if (!safePath.startsWith(workspacesRoot)) {
         throw new Error('访问路径超出 Agent 工作区范围')
+      }
+
+      // 目录可能已被删除（如删除 Agent 会话后面板仍持有旧路径），优雅返回空列表
+      if (!existsSync(safePath)) {
+        return []
       }
 
       const entries: FileEntry[] = []
@@ -2746,6 +2766,23 @@ export function registerIpcHandlers(): void {
       }
 
       shell.showItemInFolder(safePath)
+    }
+  )
+
+  // 在系统文件管理器中显示任意路径（无工作区限制，用户主动点击触发）
+  ipcMain.handle(
+    IPC_CHANNELS.SHOW_ITEM_IN_FOLDER,
+    async (_, filePath: string, candidateBasePaths?: string[]): Promise<void> => {
+      const { resolve } = await import('node:path')
+      const { existsSync } = await import('node:fs')
+      const { resolveTargetPath } = await import('./lib/file-preview-service')
+
+      const resolvedPath = resolveTargetPath(filePath, candidateBasePaths?.length ? candidateBasePaths : undefined)
+      if (!existsSync(resolvedPath)) {
+        console.warn('[IPC] shell:show-item-in-folder 路径不存在:', resolvedPath)
+        return
+      }
+      shell.showItemInFolder(resolve(resolvedPath))
     }
   )
 
@@ -4120,8 +4157,8 @@ export function registerIpcHandlers(): void {
   const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v.length > 0
   const isNonBlankString = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0
   const isFiniteInt = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v)
-  const validScheduleType = (v: unknown): v is 'interval' | 'daily' | 'weekly' =>
-    v === 'interval' || v === 'daily' || v === 'weekly'
+  const validScheduleType = (v: unknown): v is 'interval' | 'daily' | 'weekly' | 'monthly' =>
+    v === 'interval' || v === 'daily' || v === 'weekly' || v === 'monthly'
   const validPermissionMode = (v: unknown): v is 'auto' | 'bypassPermissions' =>
     v === 'auto' || v === 'bypassPermissions'
   const validAutomationNotificationTrigger = (v: unknown): v is 'always' | 'success' | 'error' =>
@@ -4159,8 +4196,14 @@ export function registerIpcHandlers(): void {
     if (i.dayOfWeek !== undefined && (!isFiniteInt(i.dayOfWeek) || i.dayOfWeek < 0 || i.dayOfWeek > 6)) {
       throw new Error(`非法的 dayOfWeek: ${String(i.dayOfWeek)}`)
     }
+    if (i.dayOfMonth !== undefined && (!isFiniteInt(i.dayOfMonth) || i.dayOfMonth < 1 || i.dayOfMonth > 31)) {
+      throw new Error(`非法的 dayOfMonth: ${String(i.dayOfMonth)}`)
+    }
     if (i.permissionMode !== undefined && !validPermissionMode(i.permissionMode)) {
       throw new Error(`非法的 permissionMode: ${String(i.permissionMode)}`)
+    }
+    if (i.sessionMode !== undefined && i.sessionMode !== 'daily' && i.sessionMode !== 'reuse') {
+      throw new Error(`非法的 sessionMode: ${String(i.sessionMode)}`)
     }
     validateAutomationNotificationTargets(i.notificationTargets)
   }
@@ -4176,8 +4219,12 @@ export function registerIpcHandlers(): void {
       if (!input || typeof input !== 'object') throw new Error('input 必须是对象')
       if (!isNonEmptyString(input.name)) throw new Error('name 必填')
       if (!isNonEmptyString(input.prompt)) throw new Error('prompt 必填')
-      if (!isNonEmptyString(input.channelId)) throw new Error('channelId 必填')
+      // channelId / workspaceId 允许为空（草稿态），但此时任务不能被启用
       validateAutomationFields(input)
+      if (input.scheduleType === 'interval' && !isFiniteInt(input.intervalMinutes)) throw new Error('scheduleType=interval 时 intervalMinutes 必填')
+      if ((input.scheduleType === 'daily' || input.scheduleType === 'weekly' || input.scheduleType === 'monthly') && !validTimeOfDay(input.timeOfDay)) throw new Error('scheduleType=daily/weekly/monthly 时 timeOfDay 必填')
+      if (input.scheduleType === 'weekly' && !isFiniteInt(input.dayOfWeek)) throw new Error('scheduleType=weekly 时 dayOfWeek 必填')
+      if (input.scheduleType === 'monthly' && input.dayOfMonth === undefined) throw new Error('scheduleType=monthly 时 dayOfMonth 必填')
       const a = createAutomation(input)
       broadcastAutomationsChanged()
       return a

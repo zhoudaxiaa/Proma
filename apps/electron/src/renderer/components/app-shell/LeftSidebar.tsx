@@ -11,7 +11,7 @@
 import * as React from 'react'
 import { useAtom, useSetAtom, useAtomValue, useStore } from 'jotai'
 import { toast } from 'sonner'
-import { Pin, PinOff, Settings, Plus, Trash2, Pencil, Plug, Zap, PanelLeftClose, PanelLeftOpen, ArrowRightLeft, Search, Archive, ArchiveRestore, ArrowLeft, Bot, MessageSquare, MoreHorizontal, FolderOpen, GripVertical, Clock, AlarmClock } from 'lucide-react'
+import { Pin, PinOff, Settings, Plus, Trash2, Pencil, Plug, Zap, PanelLeftClose, PanelLeftOpen, ArrowRightLeft, Search, Archive, ArchiveRestore, ArrowLeft, Bot, MessageSquare, MoreHorizontal, FolderOpen, GripVertical, Clock, AlarmClock, ChevronRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { ModeSwitcher } from './ModeSwitcher'
@@ -41,6 +41,7 @@ import {
   agentModelIdAtom,
   agentSessionChannelMapAtom,
   agentSessionModelMapAtom,
+  agentSessionPathMapAtom,
   currentAgentWorkspaceIdAtom,
   agentWorkspacesAtom,
   workspaceCapabilitiesVersionAtom,
@@ -341,6 +342,25 @@ function SidebarWindowDragStrip({ height }: { height: number }): React.ReactElem
   )
 }
 
+/** 不可变地切换 Set 中某个成员的存在状态（存在则删除，不存在则添加），返回新 Set */
+function toggleSetEntry<T>(prev: Set<T>, value: T): Set<T> {
+  const next = new Set(prev)
+  if (next.has(value)) {
+    next.delete(value)
+  } else {
+    next.add(value)
+  }
+  return next
+}
+
+/** 不可变地从 Set 中移除某个成员，若不存在则原样返回 */
+function deleteSetEntry<T>(prev: Set<T>, value: T): Set<T> {
+  if (!prev.has(value)) return prev
+  const next = new Set(prev)
+  next.delete(value)
+  return next
+}
+
 export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
   const [activeView, setActiveView] = useAtom(activeViewAtom)
   const setAutomationForm = useSetAtom(automationFormAtom)
@@ -364,6 +384,8 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
   const [moveTargetId, setMoveTargetId] = React.useState<string | null>(null)
   /** 每个项目额外展开显示的会话数量（每次点击"显示更多" +10），未点击则为 0 或无值 */
   const [expandedExtraCountMap, setExpandedExtraCountMap] = React.useState<Map<string, number>>(new Map())
+  /** 记录被用户手动折叠的工作区 ID（点击当前工作区标题时折叠/展开）。刻意不持久化：折叠被视为临时查看行为，刷新/重启后恢复默认展开 */
+  const [collapsedWorkspaceIds, setCollapsedWorkspaceIds] = React.useState<Set<string>>(new Set())
   /** 项目拖拽排序状态 */
   const [dragProjectId, setDragProjectId] = React.useState<string | null>(null)
   const [projectDropIndicator, setProjectDropIndicator] = React.useState<{ id: string; position: 'before' | 'after' } | null>(null)
@@ -392,6 +414,7 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
   const agentModelId = useAtomValue(agentModelIdAtom)
   const setSessionChannelMap = useSetAtom(agentSessionChannelMapAtom)
   const setSessionModelMap = useSetAtom(agentSessionModelMapAtom)
+  const setSessionPathMap = useSetAtom(agentSessionPathMapAtom)
   const [currentWorkspaceId, setCurrentWorkspaceId] = useAtom(currentAgentWorkspaceIdAtom)
   const [workspaces, setWorkspaces] = useAtom(agentWorkspacesAtom)
   const setMode = useSetAtom(appModeAtom)
@@ -468,6 +491,8 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
     setDiffData(deleteKey)
     setSessionChannelMap(deleteKey)
     setSessionModelMap(deleteKey)
+    // 会话工作目录路径：不清理会导致右侧文件面板继续用已删除目录请求 list-directory
+    setSessionPathMap(deleteKey)
     // 视图状态（预览开关 + 上次视图）：删除/归档是终态，统一清理避免孤立条目
     setSessionViewStateMap(deleteKey)
 
@@ -497,7 +522,7 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
     sessionExistsAtom.remove(id)
 
     clearPreviewCacheForSession(id)
-  }, [setConvModels, setConvContextLength, setConvThinking, setConvParallel, setConvPromptId, setPreviewPanelOpen, setPreviewFile, setDiffPanelTab, setDiffRefreshVersion, setDiffUnseen, setDiffUnseenFiles, setDiffData, setSessionChannelMap, setSessionModelMap, setSessionViewStateMap, setStreamingStates, setLiveMessagesMap, setSessionPendingFiles, store])
+  }, [setConvModels, setConvContextLength, setConvThinking, setConvParallel, setConvPromptId, setPreviewPanelOpen, setPreviewFile, setDiffPanelTab, setDiffRefreshVersion, setDiffUnseen, setDiffUnseenFiles, setDiffData, setSessionChannelMap, setSessionModelMap, setSessionPathMap, setSessionViewStateMap, setStreamingStates, setLiveMessagesMap, setSessionPendingFiles, store])
 
   const currentWorkspaceSlug = React.useMemo(() => {
     if (!currentWorkspaceId) return null
@@ -824,10 +849,16 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
     await createAgentSessionInWorkspace()
   }, [createAgentSessionInWorkspace, setActiveView])
 
-  /** 切换当前项目 */
+  /** 切换当前项目；点击当前已选中工作区标题时则折叠/展开其会话列表 */
   const handleSelectProject = React.useCallback((workspaceId: string): void => {
-    if (workspaceId === currentWorkspaceId) return
+    if (workspaceId === currentWorkspaceId) {
+      // 点击当前工作区 → 折叠/展开会话列表
+      setCollapsedWorkspaceIds((prev) => toggleSetEntry(prev, workspaceId))
+      return
+    }
     setCurrentWorkspaceId(workspaceId)
+    // 切换到新工作区时，自动展开该工作区
+    setCollapsedWorkspaceIds((prev) => deleteSetEntry(prev, workspaceId))
     window.electronAPI.updateSettings({ agentWorkspaceId: workspaceId }).catch(console.error)
   }, [currentWorkspaceId, setCurrentWorkspaceId])
 
@@ -914,6 +945,8 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
         next.delete(workspaceId)
         return next
       })
+
+      setCollapsedWorkspaceIds((prev) => deleteSetEntry(prev, workspaceId))
 
       if (workspaceId === currentWorkspaceId) {
         const fallback = remainingWorkspaces.find((item) => item.slug === 'default') ?? remainingWorkspaces[0] ?? null
@@ -1517,7 +1550,7 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
                 type="button"
                 aria-label={mode === 'agent' ? '新建 Agent 会话' : '新建 Chat 对话'}
                 onClick={mode === 'agent' ? handleNewAgentSession : handleNewConversation}
-                className="size-10 flex items-center justify-center rounded-[12px] text-foreground/70 bg-primary/5 hover:bg-primary/10 transition-colors titlebar-no-drag border border-dashed border-[hsl(var(--dashed-border))] hover:border-[hsl(var(--dashed-border-hover))]"
+                className="size-10 flex items-center justify-center rounded-[12px] text-foreground/70 bg-primary/5 hover:bg-primary/10 hover:text-foreground transition-[background-color,border-color,color] duration-150 titlebar-no-drag border border-border/60 hover:border-border"
               >
                 <Plus size={16} />
               </button>
@@ -1533,7 +1566,7 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
                 type="button"
                 aria-label="搜索"
                 onClick={() => setSearchDialogOpen(true)}
-                className="size-10 flex items-center justify-center rounded-[12px] text-foreground/45 bg-primary/5 hover:bg-primary/10 hover:text-foreground/70 transition-colors titlebar-no-drag border border-dashed border-[hsl(var(--dashed-border))] hover:border-[hsl(var(--dashed-border-hover))]"
+                className="size-10 flex items-center justify-center rounded-[12px] text-foreground/45 bg-primary/5 hover:bg-primary/10 hover:text-foreground/70 transition-[background-color,border-color,color] duration-150 titlebar-no-drag border border-border/60 hover:border-border"
               >
                 <Search size={16} />
               </button>
@@ -1659,7 +1692,7 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
       <div className="px-3 pt-2 flex items-center gap-1.5">
         <button
           onClick={mode === 'agent' ? handleNewAgentSession : handleNewConversation}
-          className="flex-1 flex items-center gap-2 px-3 py-2 rounded-[10px] text-[13px] font-medium text-foreground/70 bg-primary/5 hover:bg-primary/10 transition-colors duration-100 titlebar-no-drag border border-dashed border-[hsl(var(--dashed-border))] hover:border-[hsl(var(--dashed-border-hover))]"
+          className="flex-1 flex items-center gap-2 px-3 py-2 rounded-[10px] text-[13px] font-medium text-foreground/70 bg-primary/5 hover:bg-primary/10 hover:text-foreground transition-[background-color,border-color,color] duration-150 titlebar-no-drag border border-border/60 hover:border-border"
         >
           <Plus size={14} />
           <span>{mode === 'agent' ? '新会话' : '新对话'}</span>
@@ -1668,7 +1701,7 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
           <TooltipTrigger asChild>
             <button
               onClick={() => setSearchDialogOpen(true)}
-              className="flex-shrink-0 size-[36px] flex items-center justify-center rounded-[10px] text-foreground/40 bg-primary/5 hover:bg-primary/10 hover:text-foreground/60 transition-colors duration-100 titlebar-no-drag border border-dashed border-[hsl(var(--dashed-border))] hover:border-[hsl(var(--dashed-border-hover))]"
+              className="flex-shrink-0 size-[36px] flex items-center justify-center rounded-[10px] text-foreground/40 bg-primary/5 hover:bg-primary/10 hover:text-foreground/60 transition-[background-color,border-color,color] duration-150 titlebar-no-drag border border-border/60 hover:border-border"
             >
               <Search size={14} />
             </button>
@@ -1836,6 +1869,7 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
                   currentWorkspaceId={currentWorkspaceId}
                   expanded={(expandedExtraCountMap.get(group.workspace.id) ?? 0) > 0}
                   extraCount={expandedExtraCountMap.get(group.workspace.id) ?? 0}
+                  collapsed={collapsedWorkspaceIds.has(group.workspace.id)}
                   activeSessionId={activeSessionId}
                   agentIndicatorMap={agentIndicatorMap}
                   relativeTimeNow={relativeTimeNow}
@@ -2619,6 +2653,7 @@ interface AgentProjectGroupItemProps {
   group: AgentProjectGroup
   currentWorkspaceId: string | null
   expanded: boolean
+  collapsed: boolean
   /** 用户已点击"显示更多"额外展开的会话数量（基于 collapsedSessions 之上累加） */
   extraCount: number
   activeSessionId: string | null
@@ -2651,6 +2686,7 @@ const AgentProjectGroupItem = React.memo(function AgentProjectGroupItem({
   group,
   currentWorkspaceId,
   expanded,
+  collapsed,
   extraCount,
   activeSessionId,
   agentIndicatorMap,
@@ -2790,7 +2826,12 @@ const AgentProjectGroupItem = React.memo(function AgentProjectGroupItem({
         ) : (
           <button
             type="button"
-            onClick={() => onSelectProject(group.workspace.id)}
+            aria-expanded={!collapsed}
+            aria-controls={`project-sessions-${group.workspace.id}`}
+            onClick={(e) => {
+              e.stopPropagation()
+              onSelectProject(group.workspace.id)
+            }}
             className={cn(
               'relative flex-1 min-w-0 flex items-center gap-1 px-1 py-1 rounded-md text-left transition-[padding,color,background-color] titlebar-no-drag group-hover/project:pl-4 group-hover/project:pr-11 hover:bg-foreground/[0.025]',
               isCurrent
@@ -2802,6 +2843,13 @@ const AgentProjectGroupItem = React.memo(function AgentProjectGroupItem({
             <span className="flex-1 min-w-0 truncate text-[13px] font-medium leading-[18px]">
               {group.workspace.name}
             </span>
+            <ChevronRight
+              size={12}
+              className={cn(
+                'flex-shrink-0 text-foreground/30 transition-transform duration-150',
+                collapsed ? '-rotate-90' : 'rotate-90',
+              )}
+            />
           </button>
         )}
 
@@ -2870,52 +2918,54 @@ const AgentProjectGroupItem = React.memo(function AgentProjectGroupItem({
         </DropdownMenu>
       </div>
 
-      <div className="ml-4 mt-px">
-        {group.sessions.length > 0 ? (
-          <div className="flex flex-col gap-0.5">
-            {sessions.map((session) => (
-              <AgentSessionItem
-                key={session.id}
-                session={session}
-                active={session.id === activeSessionId}
-                indicatorStatus={agentIndicatorMap.get(session.id) ?? 'idle'}
-                showPinIcon={!!session.pinned}
-                leftAccent={getSessionLeftAccent(agentIndicatorMap.get(session.id) ?? 'idle')}
-                relativeTimeNow={relativeTimeNow}
-                onSelect={onSelectSession}
-                onRequestDelete={onRequestDelete}
-                onRequestMove={onRequestMove}
-                onRename={onRename}
-                onTogglePin={onTogglePin}
-                onToggleArchive={onToggleArchive}
-              />
-            ))}
+      <div id={`project-sessions-${group.workspace.id}`} className="ml-4 mt-px">
+        {!collapsed ? (
+          group.sessions.length > 0 ? (
+            <div className="flex flex-col gap-0.5">
+              {sessions.map((session) => (
+                <AgentSessionItem
+                  key={session.id}
+                  session={session}
+                  active={session.id === activeSessionId}
+                  indicatorStatus={agentIndicatorMap.get(session.id) ?? 'idle'}
+                  showPinIcon={!!session.pinned}
+                  leftAccent={getSessionLeftAccent(agentIndicatorMap.get(session.id) ?? 'idle')}
+                  relativeTimeNow={relativeTimeNow}
+                  onSelect={onSelectSession}
+                  onRequestDelete={onRequestDelete}
+                  onRequestMove={onRequestMove}
+                  onRename={onRename}
+                  onTogglePin={onTogglePin}
+                  onToggleArchive={onToggleArchive}
+                />
+              ))}
 
-            {hiddenCount > 0 && (
-              <button
-                type="button"
-                onClick={() => onShowMore(group.workspace.id)}
-                className="w-full text-left px-1.5 py-1 rounded-md text-[12px] text-foreground/35 hover:bg-foreground/[0.03] hover:text-foreground/60 transition-colors titlebar-no-drag"
-              >
-                显示更多
-              </button>
-            )}
+              {hiddenCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => onShowMore(group.workspace.id)}
+                  className="w-full text-left px-1.5 py-1 rounded-md text-[12px] text-foreground/35 hover:bg-foreground/[0.03] hover:text-foreground/60 transition-colors titlebar-no-drag"
+                >
+                  显示更多
+                </button>
+              )}
 
-            {expanded && (
-              <button
-                type="button"
-                onClick={() => onCollapseExtra(group.workspace.id)}
-                className="w-full text-left px-1.5 py-1 rounded-md text-[12px] text-foreground/35 hover:bg-foreground/[0.03] hover:text-foreground/60 transition-colors titlebar-no-drag"
-              >
-                收起
-              </button>
-            )}
-          </div>
-        ) : (
-          <div className="px-1.5 py-0.5 text-[12px] text-foreground/22 select-none">
-            暂无会话
-          </div>
-        )}
+              {expanded && (
+                <button
+                  type="button"
+                  onClick={() => onCollapseExtra(group.workspace.id)}
+                  className="w-full text-left px-1.5 py-1 rounded-md text-[12px] text-foreground/35 hover:bg-foreground/[0.03] hover:text-foreground/60 transition-colors titlebar-no-drag"
+                >
+                  收起
+                </button>
+              )}
+            </div>
+          ) : (
+            <div className="px-1.5 py-0.5 text-[12px] text-foreground/22 select-none">
+              暂无会话
+            </div>
+          )
+        ) : null}
       </div>
       {dropPosition === 'after' && (
         <div className="absolute -bottom-0.5 left-3 right-3 h-0.5 rounded-full bg-primary z-10" />

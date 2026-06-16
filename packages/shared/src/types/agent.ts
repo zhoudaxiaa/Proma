@@ -422,7 +422,7 @@ export interface TypedError {
 
 /** Agent 事件 Usage 信息 */
 export interface AgentEventUsage {
-  inputTokens: number
+  inputTokens?: number
   outputTokens?: number
   cacheReadTokens?: number
   cacheCreationTokens?: number
@@ -559,6 +559,7 @@ export type PromaEvent =
   | { type: 'plan_mode_changed'; sessionId: string; active: boolean; source: AgentPlanModeChangeSource }
   | { type: 'retry'; status: 'starting' | 'attempt' | 'cleared' | 'failed'; attempt?: number; maxAttempts?: number; delaySeconds?: number; reason?: string; attemptData?: RetryAttempt; error?: TypedError }
   | { type: 'model_resolved'; model: string }
+  | { type: 'context_window'; contextWindow: number }
   | { type: 'permission_mode_changed'; mode: PromaPermissionMode }
   | { type: 'title_updated'; title: string }
   | { type: 'external_run_started'; source: AgentExternalRunSource; sessionId: string; title?: string; workspaceId?: string; modelId?: string; startedAt: number }
@@ -587,6 +588,8 @@ export interface AgentSessionMeta {
   title: string
   /** 使用的渠道 ID */
   channelId?: string
+  /** 使用的模型 ID（自动任务子会话恢复输入框模型选择时使用） */
+  modelId?: string
   /** SDK 内部会话 ID（用于 resume 衔接上下文） */
   sdkSessionId?: string
   /** 所属工作区 ID */
