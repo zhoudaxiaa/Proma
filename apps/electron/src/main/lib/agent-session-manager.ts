@@ -918,6 +918,21 @@ export function truncateSDKMessages(id: string, upToUuidInclusive: string): SDKM
 }
 
 /**
+ * 按照数量截断 SDK 消息
+ */
+export function truncateSDKMessagesToCount(id: string, keepCount: number): SDKMessage[] {
+  const messages = getAgentSessionSDKMessages(id)
+  const kept = messages.slice(0, keepCount)
+
+  const filePath = getAgentSessionMessagesPath(id)
+  const content = kept.map((m) => JSON.stringify(m)).join('\n') + (kept.length > 0 ? '\n' : '')
+  writeFileSync(filePath, content, 'utf-8')
+
+  console.log(`[Agent 会话] 消息已按数量截断: sessionId=${id}, 保留 ${kept.length}/${messages.length} 条`)
+  return kept
+}
+
+/**
  * 从 SDK session JSONL 中查找指定 assistant message 之后最近的 user message UUID
  *
  * SDK session JSONL（~/.proma/sdk-config/projects/...）中的消息都带有 uuid，

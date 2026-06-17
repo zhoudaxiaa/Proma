@@ -110,6 +110,10 @@ interface AgentMessagesProps {
   onFork?: (upToMessageUuid: string) => void
   onRewind?: (assistantMessageUuid: string) => void
   onCompact?: () => void
+  /** 编辑用户消息回调 */
+  onEdit?: (userMessage: SDKMessage) => void
+  /** 编辑模式：隐藏该索引之后的所有消息（包含该索引） */
+  hiddenAfterIndex?: number
 }
 
 /** 空状态引导 — 使用 WelcomeEmptyState */
@@ -393,7 +397,7 @@ function AgentRunningIndicator({ startedAt }: { startedAt?: number }): React.Rea
   )
 }
 
-export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persistedSDKMessages, streaming, streamState, liveMessages, sessionPath, attachedDirs, stoppedByUser, onRetry, onRetryInNewSession, onFork, onRewind, onCompact }: AgentMessagesProps): React.ReactElement {
+export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persistedSDKMessages, streaming, streamState, liveMessages, sessionPath, attachedDirs, stoppedByUser, onRetry, onRetryInNewSession, onFork, onRewind, onCompact, onEdit, hiddenAfterIndex }: AgentMessagesProps): React.ReactElement {
   const userProfile = useAtomValue(userProfileAtom)
   const setMinimapCache = useSetAtom(tabMinimapCacheAtom)
   const channels = useAtomValue(channelsAtom)
@@ -529,7 +533,18 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
       ...liveWithKeys,
     ]
   }, [persistedSDKMessages, liveMessages, streaming])
-  const hasContent = allSDKMessages.length > 0
+
+  // 编辑模式：根据 hiddenAfterIndex 过滤隐藏的消息
+  const displayMessages = React.useMemo(() => {
+    if (hiddenAfterIndex === undefined) return allSDKMessages
+    // hiddenAfterIndex 基于原始的 persistedSDKMessages 索引，
+    // 但在 allSDKMessages 中可能混入了 liveMessages（在末尾），
+    // 取 persistedSDKMessages 与 allSDKMessages 的交集长度作为实际截断点
+    const actualCut = Math.min(hiddenAfterIndex, allSDKMessages.length)
+    return allSDKMessages.slice(0, actualCut)
+  }, [allSDKMessages, hiddenAfterIndex])
+
+  const hasContent = displayMessages.length > 0
 
   // 压缩流程进行中（含收尾窗口：compact_boundary 已到但 result 未到）
   // → 一律抑制 AgentRunningIndicator，避免压缩分隔符切换期间闪烁。
@@ -538,16 +553,19 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
   const suppressAgentRunning = streamState?.isCompacting || streamState?.compactInFlight
 
   // 统一分组：将持久化 + 实时消息合并后再分组，确保 system 消息（如压缩分割线）出现在正确位置
+  // 编辑模式下使用 displayMessages（隐藏编辑点后的消息）
   const allGroups = React.useMemo(() => {
-    return groupIntoTurns(allSDKMessages, sessionModelId)
-  }, [allSDKMessages, sessionModelId])
+    const msgs = hiddenAfterIndex !== undefined ? displayMessages : allSDKMessages
+    return groupIntoTurns(msgs, sessionModelId)
+  }, [allSDKMessages, displayMessages, hiddenAfterIndex, sessionModelId])
 
   // 跨 turn 历史 TaskCreate id → subject 映射：顶层算一次，避免每个 AssistantTurnRenderer
   // 都对全量 allMessages 做 O(M) 扫描（流式期间 useMemo 因 allMessages 引用变化失效，
   // 长会话会触发 O(T × M) 雪崩）。
   const historicalTaskSubjects = React.useMemo(() => {
-    return buildHistoricalTaskSubjects(allSDKMessages)
-  }, [allSDKMessages])
+    const msgs = hiddenAfterIndex !== undefined ? displayMessages : allSDKMessages
+    return buildHistoricalTaskSubjects(msgs)
+  }, [allSDKMessages, displayMessages, hiddenAfterIndex])
 
   // 标记哪些 group 属于实时流式消息（用于 isStreaming / onFork 差异化渲染）
   const liveGroupSet = React.useMemo(() => {
@@ -637,6 +655,7 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
                   onRetry={shouldDisableActions ? undefined : onRetry}
                   onRetryInNewSession={shouldDisableActions ? undefined : onRetryInNewSession}
                   onCompact={shouldDisableActions ? undefined : onCompact}
+                  onEdit={shouldDisableActions ? undefined : onEdit}
                   isStreaming={isLive || undefined}
                   stoppedByUser={isLastAssistantTurn || undefined}
                   sessionModelId={sessionModelId}

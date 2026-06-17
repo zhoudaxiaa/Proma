@@ -81,6 +81,7 @@ import type {
   ForkSessionInput,
   RewindSessionInput,
   RewindSessionResult,
+  TruncateSessionMessagesInput,
   AgentMessageSearchResult,
   AgentSessionReferenceSearchInput,
   AgentSessionReferenceSearchResult,
@@ -450,6 +451,9 @@ export interface ElectronAPI {
 
   /** 快照回退（同一会话内回退到指定点，恢复文件 + 截断对话） */
   rewindSession: (input: RewindSessionInput) => Promise<RewindSessionResult>
+
+  /** 直接截断会话消息（不涉及 SDK 会话，作为 rewindSession 的降级方案） */
+  truncateSessionMessages: (input: TruncateSessionMessagesInput) => Promise<SDKMessage[]>
 
   /** 生成 Agent 会话标题 */
   generateAgentTitle: (input: AgentGenerateTitleInput) => Promise<string | null>
@@ -1452,6 +1456,10 @@ const electronAPI: ElectronAPI = {
 
   rewindSession: (input: RewindSessionInput) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.REWIND_SESSION, input)
+  },
+
+  truncateSessionMessages: (input: TruncateSessionMessagesInput) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.TRUNCATE_MESSAGES, input)
   },
 
   generateAgentTitle: (input: AgentGenerateTitleInput) => {

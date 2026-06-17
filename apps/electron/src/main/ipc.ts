@@ -84,6 +84,7 @@ import type {
   ForkSessionInput,
   RewindSessionInput,
   RewindSessionResult,
+  TruncateSessionMessagesInput,
   AgentSessionReferenceSearchInput,
   FeishuConfigInput,
   FeishuConfig,
@@ -180,8 +181,10 @@ import {
   forkAgentSession,
   autoArchiveAgentSessions,
   cleanupStaleAttachedPaths,
-  searchAgentSessionMessages,
-  searchAgentSessionReferences,
+	  searchAgentSessionMessages,
+	  searchAgentSessionReferences,
+	  truncateSDKMessages,
+	  truncateSDKMessagesToCount,
 } from './lib/agent-session-manager'
 import { runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, queueAgentMessage, updateAgentPermissionMode, rewindAgentSession } from './lib/agent-service'
 import { permissionService } from './lib/agent-permission-service'
@@ -1824,6 +1827,31 @@ export function registerIpcHandlers(): void {
         input.sessionId,
         input.assistantMessageUuid,
       )
+    }
+  )
+
+  // 直接截断会话消息（不涉及 SDK 会话，作为 rewindSession 的降级方案）
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.TRUNCATE_MESSAGES,
+    async (_, input: TruncateSessionMessagesInput): Promise<SDKMessage[]> => {
+      let result: SDKMessage[]
+      if (input.upToMessageUuid) {
+        result = truncateSDKMessages(input.sessionId, input.upToMessageUuid)
+      } else if (input.keepCount !== undefined) {
+        result = truncateSDKMessagesToCount(input.sessionId, input.keepCount)
+      } else {
+        throw new Error('TRUNCATE_MESSAGES: 需要提供 upToMessageUuid 或 keepCount')
+      }
+
+      // 降级模式下清除 SDK session，迫使下次发送时用 buildContextPrompt 重构上下文
+      if (input.clearSdkSessionId) {
+        updateAgentSessionMeta(input.sessionId, {
+          sdkSessionId: undefined,
+          resumeAtMessageUuid: undefined,
+        })
+      }
+
+      return result
     }
   )
 

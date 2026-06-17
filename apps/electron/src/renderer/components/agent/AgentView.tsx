@@ -17,7 +17,7 @@ import * as React from 'react'
 import { unstable_batchedUpdates } from 'react-dom'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
 import { toast } from 'sonner'
-import { Bot, CornerDownLeft, Square, Settings, Paperclip, FolderPlus, X, Copy, Check, Brain, Sparkles, Eye } from 'lucide-react'
+import { Bot, CornerDownLeft, Square, Settings, Paperclip, FolderPlus, X, Copy, Check, Brain, Sparkles, Eye, Pencil } from 'lucide-react'
 import { AgentMessages } from './AgentMessages'
 import { AgentHeader } from './AgentHeader'
 import { ContextUsageBadge } from './ContextUsageBadge'
@@ -463,6 +463,26 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const [workspaceFilesPath, setWorkspaceFilesPath] = React.useState<string | null>(null)
   const [isDragOver, setIsDragOver] = React.useState(false)
   const [errorCopied, setErrorCopied] = React.useState(false)
+
+  /** 编辑消息状态 */
+  const [editingMessage, setEditingMessage] = React.useState<{
+    /** 被编辑的 SDKUserMessage */
+    message: SDKMessage
+    /** 提取的用户文本 */
+    userText: string
+    /** 在 persistedSDKMessages 中的索引 */
+    index: number
+    /** 编辑前的输入草稿（取消时恢复） */
+    savedDraft: string
+    /** 编辑前的内容（用于比较是否有改动） */
+    originalText: string
+  } | null>(null)
+
+  /** 编辑模式：计算隐藏消息的索引和显示消息列表 */
+  const hiddenAfterIndex = editingMessage ? editingMessage.index : undefined
+  const displaySDKMessages = hiddenAfterIndex !== undefined
+    ? persistedSDKMessages.slice(0, hiddenAfterIndex)
+    : persistedSDKMessages
 
   // pendingFiles ref（供 addFilesAsAttachments 读取最新列表，避免闭包旧值）
   const pendingFilesRef = React.useRef(pendingFiles)
@@ -1693,6 +1713,190 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     }).catch(console.error)
   }, [persistedSDKMessages, sessionId, agentChannelId, agentModelId, currentWorkspaceId, streaming, setAgentStreamErrors, setStreamingStates, permissionMode])
 
+  /** 编辑消息：将用户消息内容回填到输入框 */
+  const handleEditRequest = React.useCallback((userMessage: SDKMessage): void => {
+    if (streaming) {
+      toast.info('流式输出中，无法编辑')
+      return
+    }
+    if (!messagesLoaded) {
+      toast.info('消息未加载完成')
+      return
+    }
+
+    const text = getUserTextFromSDKMessage(userMessage)
+    if (!text) {
+      toast.info('无法提取消息文本')
+      return
+    }
+
+    // 用户消息对象不带 uuid（orchestrator 持久化时未赋值），
+    // 直接用对象引用在 persistedSDKMessages 中定位索引
+    const index = persistedSDKMessages.indexOf(userMessage)
+    if (index < 0) {
+      console.warn('[AgentView] 编辑: 找不到消息引用（可能不是持久化消息）')
+      return
+    }
+
+    // 保存当前输入草稿，设置编辑状态
+    const currentDraft = inputContent
+    setEditingMessage({
+      message: userMessage,
+      userText: text,
+      index,
+      savedDraft: currentDraft,
+      originalText: text,
+    })
+    setInputContent(text)
+  }, [streaming, messagesLoaded, persistedSDKMessages, inputContent, setInputContent])
+
+  /** 取消编辑：恢复原始状态 */
+  const handleCancelEdit = React.useCallback((): void => {
+    if (!editingMessage) return
+    // 恢复编辑前的草稿
+    setInputContent(editingMessage.savedDraft)
+    setEditingMessage(null)
+  }, [editingMessage, setInputContent])
+
+  /** 提交编辑：回退 SDK 会话 + 发送编辑后的消息 */
+  const handleEditSend = React.useCallback(async (): Promise<void> => {
+    if (!editingMessage || !agentChannelId || streaming) return
+
+    const text = inputContent.trim()
+    if (!text) return
+
+    try {
+      // 1. 找到被编辑消息之前最后一条 assistant UUID
+      const msgs = persistedSDKMessages
+      const editIndex = editingMessage.index
+      let assistantUuid: string | undefined
+      let assistantIndex = -1
+
+      for (let i = editIndex - 1; i >= 0; i--) {
+        const msg = msgs[i] as unknown as { type?: string; uuid?: string }
+        if (msg?.type === 'assistant' && msg?.uuid) {
+          assistantUuid = msg.uuid
+          assistantIndex = i
+          break
+        }
+      }
+
+      // 2. 磁盘消息截断 + SDK 级别回退（优先）
+      //    策略：先用 rewindSession（SDK 回退 + 文件恢复 + 磁盘截断），
+      //    失败则降级为直接按消息数量截断磁盘。
+      const truncateCount = assistantIndex >= 0 ? assistantIndex + 1 : editIndex
+      if (assistantUuid) {
+        try {
+          const result = await window.electronAPI.rewindSession({
+            sessionId,
+            assistantMessageUuid: assistantUuid,
+          })
+
+          // 显示回退 toast
+          if (result?.fileRewind?.canRewind) {
+            const fileCount = result.fileRewind.filesChanged?.length ?? 0
+            toast.success('已回退到此处', {
+              description: fileCount > 0 ? `${fileCount} 个文件已恢复` : '文件无变化',
+            })
+          } else if (result?.fileRewind?.error) {
+            toast.warning('已回退对话', {
+              description: `文件恢复不可用：${result.fileRewind.error}`,
+            })
+          } else {
+            toast.success('已回退到此处')
+          }
+	        } catch (rewindError) {
+	          // rewindSession 失败（无 SDK session / UUID 未找到等），
+	          // 降级为直接按数量截断磁盘 + 清除 SDK session，不阻塞编辑流程
+	          console.warn('[AgentView] SDK 回退失败，回退到直接截断:', rewindError)
+	          try {
+	            await window.electronAPI.truncateSessionMessages({
+	              sessionId,
+	              keepCount: truncateCount,
+	              clearSdkSessionId: true,
+	            })
+	          } catch (truncateError) {
+	            console.warn('[AgentView] 直接截断也失败，仅前端截断:', truncateError)
+	          }
+	        }
+	      } else {
+	        // 没有前一轮 assistant（如首条消息），直接按数量截断磁盘 + 清除 SDK session
+	        try {
+	          await window.electronAPI.truncateSessionMessages({
+	            sessionId,
+	            keepCount: truncateCount,
+	            clearSdkSessionId: true,
+	          })
+        } catch (truncateError) {
+          console.warn('[AgentView] 直接截断失败（首条消息），仅前端截断:', truncateError)
+        }
+      }
+
+      // 3. 手动同步内存中的消息列表（keepCount 与磁盘截断保持一致）
+      const truncatedMsgs = persistedSDKMessagesRef.current.slice(0, truncateCount)
+      persistedSDKMessagesRef.current = truncatedMsgs
+      setPersistedSDKMessages(truncatedMsgs)
+
+      // 4. 清除编辑状态
+      setEditingMessage(null)
+
+      // 5. 发送编辑后的消息
+      const streamStartedAt = Date.now()
+      setStreamingStates((prev) => {
+        const map = new Map(prev)
+        const existing = prev.get(sessionId)
+        map.set(sessionId, {
+          running: true,
+          content: '',
+          toolActivities: [],
+          model: agentModelId || undefined,
+          startedAt: streamStartedAt,
+          inputTokens: existing?.inputTokens,
+          contextWindow: existing?.contextWindow,
+        })
+        return map
+      })
+
+      // 乐观消息（依附于已截断的内存数组）
+      const tempUserSDKMsg: SDKMessage = {
+        type: 'user',
+        message: {
+          content: [{ type: 'text', text }],
+        },
+        parent_tool_use_id: null,
+        _createdAt: Date.now(),
+      } as unknown as SDKMessage
+      appendOptimisticPersistedMessage(tempUserSDKMsg)
+
+      setInputContent('')
+      setInputHtmlContent('')
+
+      window.electronAPI.sendAgentMessage({
+        sessionId,
+        userMessage: text,
+        channelId: agentChannelId,
+        modelId: agentModelId || undefined,
+        workspaceId: currentWorkspaceId || undefined,
+        startedAt: streamStartedAt,
+        permissionModeOverride: permissionMode,
+      }).catch((error) => {
+        console.error('[AgentView] 编辑发送失败:', error)
+        setStreamingStates((prev) => {
+          const current = prev.get(sessionId)
+          if (!current) return prev
+          const map = new Map(prev)
+          map.set(sessionId, { ...current, running: false })
+          return map
+        })
+      })
+    } catch (error) {
+      console.error('[AgentView] 编辑失败:', error)
+      toast.error('编辑消息失败', { description: String(error) })
+      // 出错时也清除编辑状态，让用户看到原始消息
+      setEditingMessage(null)
+    }
+  }, [editingMessage, agentChannelId, agentModelId, sessionId, permissionMode, persistedSDKMessages, inputContent, streaming, setInputContent, setInputHtmlContent, setStreamingStates, appendOptimisticPersistedMessage])
+
   /** 在新对话继续：创建新会话 + 切换 tab + 使用 &session 引用旧会话 */
   const handleRetryInNewSession = React.useCallback(async (): Promise<void> => {
     if (!agentChannelId) return
@@ -2032,7 +2236,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           sessionId={sessionId}
           sessionModelId={agentModelId || undefined}
           messagesLoaded={messagesLoaded}
-          persistedSDKMessages={persistedSDKMessages}
+          persistedSDKMessages={displaySDKMessages}
           streaming={streaming}
           streamState={streamState}
           liveMessages={liveMessages}
@@ -2044,6 +2248,8 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           onFork={handleFork}
           onRewind={handleRewindRequest}
           onCompact={handleCompact}
+          onEdit={handleEditRequest}
+          hiddenAfterIndex={hiddenAfterIndex}
         />
 
         {/* 权限请求横幅 */}
@@ -2134,10 +2340,29 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
               </div>
             )}
 
+            {/* 编辑横幅 */}
+            {editingMessage && (
+              <div className="flex items-center justify-between gap-2 px-3 pt-2.5 pb-1.5 border-b border-border/40">
+                <div className="flex items-center gap-2 text-sm text-foreground/70">
+                  <Pencil className="size-3.5" />
+                  <span>正在编辑消息</span>
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 text-xs text-foreground/60 hover:text-foreground"
+                  onClick={handleCancelEdit}
+                >
+                  取消编辑
+                </Button>
+              </div>
+            )}
+
             <RichTextInput
               value={inputContent}
               onChange={setInputContent}
-              onSubmit={handleSend}
+              onSubmit={editingMessage ? handleEditSend : handleSend}
               onPasteFiles={handlePasteFiles}
               onPasteLongText={handlePasteLongText}
               longTextPasteThreshold={LONG_TEXT_ATTACHMENT_THRESHOLD}

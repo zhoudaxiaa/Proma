@@ -911,6 +911,27 @@ export interface RewindSessionInput {
   assistantMessageUuid: string
 }
 
+/** 直接截断 Agent 会话消息（不涉及 SDK 状态） */
+export interface TruncateSessionMessagesInput {
+  /** Proma 会话 ID */
+  sessionId: string
+  /**
+   * 截断到哪条消息的 UUID（inclusive，保留该消息及其之前的一切）。
+   * 与 keepCount 二选一，同时提供时优先使用 uuid。
+   */
+  upToMessageUuid?: string
+  /**
+   * 保留前 N 条消息（0 = 清空全部）。
+   * 与 upToMessageUuid 二选一。
+   */
+  keepCount?: number
+  /**
+   * 截断后是否清除 SDK session ID（迫使下次发送时重新构建上下文）。
+   * 当作为 rewindSession 的降级使用时应设为 true。
+   */
+  clearSdkSessionId?: boolean
+}
+
 /** 快照回退结果 */
 export interface RewindSessionResult {
   /** 截断后剩余的消息数 */
@@ -1315,6 +1336,8 @@ export const AGENT_IPC_CHANNELS = {
   FORK_SESSION: 'agent:fork-session',
   /** 快照回退（同一会话内回退到指定点，恢复文件 + 截断对话） */
   REWIND_SESSION: 'agent:rewind-session',
+  /** 直接截断会话消息（不涉及 SDK 会话，作为 rewindSession 的降级方案） */
+  TRUNCATE_MESSAGES: 'agent:truncate-messages',
 
   // 工作区管理
   /** 获取工作区列表 */

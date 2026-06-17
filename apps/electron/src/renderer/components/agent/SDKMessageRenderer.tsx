@@ -12,7 +12,7 @@
  */
 
 import * as React from 'react'
-import { Bot, Loader2, AlertTriangle, FileText, FileImage, Download, Split, Undo2, RotateCw, Plus, Minimize2, Wrench, Settings, ExternalLink, Quote, Clock } from 'lucide-react'
+import { Bot, Loader2, AlertTriangle, FileText, FileImage, Download, Split, Undo2, RotateCw, Plus, Minimize2, Wrench, Settings, ExternalLink, Quote, Clock, Pencil } from 'lucide-react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { cn } from '@/lib/utils'
 import { ImageLightbox } from '@/components/ui/image-lightbox'
@@ -1042,7 +1042,7 @@ function ScheduledRunBadge(): React.ReactElement {
   )
 }
 
-function UserInputMessage({ message }: { message: SDKUserMessage }): React.ReactElement {
+function UserInputMessage({ message, onEdit }: { message: SDKUserMessage; onEdit?: (message: SDKUserMessage) => void }): React.ReactElement {
   const userProfile = useAtomValue(userProfileAtom)
   const rawText = extractUserText(message) ?? ''
   const isScheduledRun = rawText.includes(SCHEDULED_RUN_MARKER)
@@ -1099,6 +1099,14 @@ function UserInputMessage({ message }: { message: SDKUserMessage }): React.React
       {text && (
         <MessageActions className="pl-[46px] mt-0.5">
           <CopyButton content={text} />
+          {onEdit && (
+            <MessageAction
+              tooltip="编辑消息"
+              onClick={() => onEdit(message)}
+            >
+              <Pencil className="size-3.5" />
+            </MessageAction>
+          )}
         </MessageActions>
       )}
     </Message>
@@ -1316,6 +1324,8 @@ export interface MessageGroupRendererProps {
   onRetryInNewSession?: () => void
   /** 压缩上下文回调（仅 prompt_too_long 错误使用） */
   onCompact?: () => void
+  /** 编辑用户消息回调 */
+  onEdit?: (userMessage: SDKUserMessage) => void
   /** 是否正在流式输出中（隐藏操作栏） */
   isStreaming?: boolean
   /** 是否被用户中断 */
@@ -1398,13 +1408,13 @@ export function getGroupPreview(group: MessageGroup): string {
   return texts.join(' ').slice(0, 200)
 }
 
-export function MessageGroupRenderer({ group, allMessages, historicalTaskSubjects, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, isStreaming, stoppedByUser, sessionModelId }: MessageGroupRendererProps): React.ReactElement | null {
+export function MessageGroupRenderer({ group, allMessages, historicalTaskSubjects, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, onEdit, isStreaming, stoppedByUser, sessionModelId }: MessageGroupRendererProps): React.ReactElement | null {
   const groupId = getGroupId(group)
 
   if (group.type === 'user') {
     return (
       <div data-message-id={groupId} data-message-role="user">
-        <UserInputMessage message={group.message} />
+        <UserInputMessage message={group.message} onEdit={onEdit} />
       </div>
     )
   }
