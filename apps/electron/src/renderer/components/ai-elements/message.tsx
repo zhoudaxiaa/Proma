@@ -56,7 +56,7 @@ export function Message({ className, from, ...props }: MessageProps): React.Reac
     <div
       className={cn(
         'message-item group flex w-full flex-col gap-0.5 rounded-[10px] px-2.5 py-2.5',
-        from === 'user' ? 'is-user' : 'is-assistant',
+        from === 'user' ? 'is-user items-end' : 'is-assistant',
         className
       )}
       {...props}
@@ -113,7 +113,7 @@ type MessageContentProps = HTMLAttributes<HTMLDivElement>
 
 /**
  * 消息内容区域
- * - user 消息：pl-[46px] 与头像对齐 + 浅色气泡背景
+ * - user 消息：pr-[46px] 与头像对齐 + 右对齐
  * - assistant 消息：pl-[46px] 与头像对齐
  */
 export function MessageContent({
@@ -124,9 +124,9 @@ export function MessageContent({
   return (
     <div
       className={cn(
-        'flex max-w-full min-w-0 flex-col gap-2 overflow-hidden pl-[46px]',
-        'group-[.is-user]:text-foreground group-[.is-user]:items-start',
-        'group-[.is-assistant]:w-full group-[.is-assistant]:text-foreground',
+        'flex max-w-full min-w-0 flex-col gap-2 overflow-hidden',
+        'group-[.is-user]:pr-[46px] group-[.is-user]:items-end group-[.is-user]:text-foreground',
+        'group-[.is-assistant]:pl-[46px] group-[.is-assistant]:w-full group-[.is-assistant]:text-foreground',
         className
       )}
       {...props}

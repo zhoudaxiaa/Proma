@@ -1053,9 +1053,9 @@ function UserInputMessage({ message, onEdit }: { message: SDKUserMessage; onEdit
 
   return (
     <Message from="user">
-      <div className="flex items-start gap-2.5 mb-2.5">
+      <div className="flex items-start gap-2.5 mb-2.5 flex-row-reverse">
         <UserAvatar avatar={userProfile.avatar} size={35} />
-        <div className="flex flex-col justify-between h-[35px]">
+        <div className="flex flex-col justify-between h-[35px] items-end">
           <span className="text-sm font-semibold text-foreground/60 leading-none">{userProfile.userName}</span>
           {(meta.createdAt || isScheduledRun) && (
             <span className="flex items-center gap-2 leading-none">
@@ -1072,7 +1072,7 @@ function UserInputMessage({ message, onEdit }: { message: SDKUserMessage; onEdit
       <MessageContent>
         {/* 引用文件 Chip */}
         {quotes.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 mb-2">
+          <div className="flex flex-wrap gap-1.5 mb-2 justify-end">
             {quotes.map((q, i) => (
               <QuoteChip key={`${q.path}:${i}`} quote={q} />
             ))}
@@ -1080,7 +1080,7 @@ function UserInputMessage({ message, onEdit }: { message: SDKUserMessage; onEdit
         )}
         {/* 图片缩略图 */}
         {imageFiles.length > 0 && (
-          <div className="flex flex-wrap gap-2.5 mb-2">
+          <div className="flex flex-wrap gap-2.5 mb-2 justify-end">
             {imageFiles.map((file) => (
               <AttachedImageThumb key={file.path} file={file} />
             ))}
@@ -1088,7 +1088,7 @@ function UserInputMessage({ message, onEdit }: { message: SDKUserMessage; onEdit
         )}
         {/* 非图片文件芯片 */}
         {nonImageFiles.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 mb-2">
+          <div className="flex flex-wrap gap-1.5 mb-2 justify-end">
             {nonImageFiles.map((file) => (
               <AttachedFileChip key={file.path} file={file} />
             ))}
@@ -1097,7 +1097,7 @@ function UserInputMessage({ message, onEdit }: { message: SDKUserMessage; onEdit
         {text && <UserMessageContent>{text}</UserMessageContent>}
       </MessageContent>
       {text && (
-        <MessageActions className="pl-[46px] mt-0.5">
+        <MessageActions className="pr-[46px] mt-0.5 justify-end">
           <CopyButton content={text} />
           {onEdit && (
             <MessageAction
