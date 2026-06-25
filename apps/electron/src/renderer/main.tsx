@@ -16,9 +16,11 @@ import App from './App'
 import {
   themeModeAtom,
   themeStyleAtom,
+  interfaceVariantAtom,
   systemIsDarkAtom,
   resolvedThemeAtom,
   applyThemeToDOM,
+  applyInterfaceVariantToDOM,
   initializeTheme,
 } from './atoms/theme'
 import {
@@ -35,6 +37,7 @@ import {
   agentMaxBudgetUsdAtom,
   agentMaxTurnsAtom,
   agentSettingsReadyAtom,
+  automationGroupOrderAtom,
   dockBadgeCountAtom,
   unviewedCompletedSessionIdsAtom,
 } from './atoms/agent-atoms'
@@ -91,9 +94,11 @@ const isMiniChatWindow = new URLSearchParams(window.location.search).get('window
 function ThemeInitializer(): null {
   const setThemeMode = useSetAtom(themeModeAtom)
   const setThemeStyle = useSetAtom(themeStyleAtom)
+  const setInterfaceVariant = useSetAtom(interfaceVariantAtom)
   const setSystemIsDark = useSetAtom(systemIsDarkAtom)
   const themeMode = useAtomValue(themeModeAtom)
   const themeStyle = useAtomValue(themeStyleAtom)
+  const interfaceVariant = useAtomValue(interfaceVariantAtom)
   const systemIsDark = useAtomValue(systemIsDarkAtom)
 
   // 初始化：从主进程加载设置 + 订阅系统主题变化
@@ -101,7 +106,7 @@ function ThemeInitializer(): null {
     let isMounted = true
     let cleanup: (() => void) | undefined
 
-    initializeTheme(setThemeMode, setSystemIsDark, setThemeStyle).then((fn) => {
+    initializeTheme(setThemeMode, setSystemIsDark, setThemeStyle, setInterfaceVariant).then((fn) => {
       if (isMounted) {
         cleanup = fn
       } else {
@@ -114,7 +119,7 @@ function ThemeInitializer(): null {
       isMounted = false
       cleanup?.()
     }
-  }, [setThemeMode, setSystemIsDark, setThemeStyle])
+  }, [setThemeMode, setSystemIsDark, setThemeStyle, setInterfaceVariant])
 
   // 响应式应用主题到 DOM
   // 用 useMemo 计算"实际会影响 DOM 的状态签名"作为唯一依赖：
@@ -134,6 +139,10 @@ function ThemeInitializer(): null {
     applyThemeToDOM(themeMode, themeStyle, systemIsDark)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [themeSignature])
+
+  useEffect(() => {
+    applyInterfaceVariantToDOM(interfaceVariant)
+  }, [interfaceVariant])
 
   return null
 }
@@ -155,6 +164,7 @@ function AgentSettingsInitializer(): null {
   const setEffort = useSetAtom(agentEffortAtom)
   const setMaxBudget = useSetAtom(agentMaxBudgetUsdAtom)
   const setMaxTurns = useSetAtom(agentMaxTurnsAtom)
+  const setAutomationGroupOrder = useSetAtom(automationGroupOrderAtom)
 
   const setAgentSettingsReady = useSetAtom(agentSettingsReadyAtom)
   const setChannels = useSetAtom(channelsAtom)
@@ -287,6 +297,9 @@ function AgentSettingsInitializer(): null {
       if (settings.agentMaxTurns != null) {
         setMaxTurns(settings.agentMaxTurns)
       }
+      if (typeof settings.agentAutomationGroupOrder === 'number') {
+        setAutomationGroupOrder(settings.agentAutomationGroupOrder)
+      }
 
       // 加载工作区列表并恢复上次选中的工作区
       window.electronAPI.listAgentWorkspaces().then((workspaces) => {
@@ -307,7 +320,7 @@ function AgentSettingsInitializer(): null {
       console.error(err)
       setAgentSettingsReady(true) // 即使出错也标记就绪，避免永远阻塞
     })
-  }, [setAgentChannelId, setAgentModelId, setAgentChannelIds, setAgentWorkspaces, setCurrentWorkspaceId, setThinking, setEffort, setMaxBudget, setMaxTurns, setChannels, setChannelsLoaded, setAgentSettingsReady])
+  }, [setAgentChannelId, setAgentModelId, setAgentChannelIds, setAgentWorkspaces, setCurrentWorkspaceId, setThinking, setEffort, setMaxBudget, setMaxTurns, setAutomationGroupOrder, setChannels, setChannelsLoaded, setAgentSettingsReady])
 
   // 工作区切换时重置能力缓存，预加载基线
   useEffect(() => {

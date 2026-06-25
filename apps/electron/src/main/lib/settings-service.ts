@@ -7,7 +7,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { getSettingsPath } from './config-paths'
-import { DEFAULT_THEME_MODE } from '../../types'
+import { DEFAULT_INTERFACE_VARIANT, DEFAULT_THEME_MODE } from '../../types'
 import type { AppSettings } from '../../types'
 
 /**
@@ -21,10 +21,12 @@ export function getSettings(): AppSettings {
   if (!existsSync(filePath)) {
     return {
       themeMode: DEFAULT_THEME_MODE,
+      interfaceVariant: DEFAULT_INTERFACE_VARIANT,
       onboardingCompleted: false,
       environmentCheckSkipped: false,
       notificationsEnabled: true,
       feishuSessionMirror: { mode: 'off' },
+      builtinMcpDisabledIds: [],
     }
   }
 
@@ -34,19 +36,23 @@ export function getSettings(): AppSettings {
     return {
       ...data,
       themeMode: data.themeMode || DEFAULT_THEME_MODE,
+      interfaceVariant: data.interfaceVariant || DEFAULT_INTERFACE_VARIANT,
       onboardingCompleted: data.onboardingCompleted ?? false,
       environmentCheckSkipped: data.environmentCheckSkipped ?? false,
       notificationsEnabled: data.notificationsEnabled ?? true,
       feishuSessionMirror: data.feishuSessionMirror ?? { mode: 'off' },
+      builtinMcpDisabledIds: data.builtinMcpDisabledIds ?? [],
     }
   } catch (error) {
     console.error('[设置] 读取失败:', error)
     return {
       themeMode: DEFAULT_THEME_MODE,
+      interfaceVariant: DEFAULT_INTERFACE_VARIANT,
       onboardingCompleted: false,
       environmentCheckSkipped: false,
       notificationsEnabled: true,
       feishuSessionMirror: { mode: 'off' },
+      builtinMcpDisabledIds: [],
     }
   }
 }

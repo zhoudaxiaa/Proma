@@ -331,7 +331,7 @@ export interface ElectronAPI {
   onSystemThemeChanged: (callback: (isDark: boolean) => void) => () => void
 
   /** 订阅用户手动切换主题事件（跨窗口同步，返回清理函数） */
-  onThemeSettingsChanged: (callback: (payload: { themeMode: string; themeStyle: string }) => void) => () => void
+  onThemeSettingsChanged: (callback: (payload: { themeMode: string; themeStyle: string; interfaceVariant?: string }) => void) => () => void
 
   // ===== Scratch Pad =====
 
@@ -509,6 +509,9 @@ export interface ElectronAPI {
 
   /** 测试 MCP 服务器连接 */
   testMcpServer: (name: string, entry: import('@proma/shared').McpServerEntry) => Promise<{ success: boolean; message: string }>
+
+  /** 启用或关闭 Proma 内置 MCP */
+  setBuiltinMcpEnabled: (workspaceSlug: string, id: string, enabled: boolean) => Promise<WorkspaceCapabilities>
 
   /** 获取工作区 Skill 列表（含活跃和不活跃） */
   getWorkspaceSkills: (workspaceSlug: string) => Promise<SkillMeta[]>
@@ -1316,8 +1319,8 @@ const electronAPI: ElectronAPI = {
     return () => { ipcRenderer.removeListener(SETTINGS_IPC_CHANNELS.ON_SYSTEM_THEME_CHANGED, listener) }
   },
 
-  onThemeSettingsChanged: (callback: (payload: { themeMode: string; themeStyle: string }) => void) => {
-    const listener = (_: unknown, payload: { themeMode: string; themeStyle: string }): void => callback(payload)
+  onThemeSettingsChanged: (callback: (payload: { themeMode: string; themeStyle: string; interfaceVariant?: string }) => void) => {
+    const listener = (_: unknown, payload: { themeMode: string; themeStyle: string; interfaceVariant?: string }): void => callback(payload)
     ipcRenderer.on(SETTINGS_IPC_CHANNELS.ON_THEME_SETTINGS_CHANGED, listener)
     return () => { ipcRenderer.removeListener(SETTINGS_IPC_CHANNELS.ON_THEME_SETTINGS_CHANGED, listener) }
   },
@@ -1544,6 +1547,10 @@ const electronAPI: ElectronAPI = {
 
   testMcpServer: (name: string, entry: import('@proma/shared').McpServerEntry) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.TEST_MCP_SERVER, name, entry) as Promise<{ success: boolean; message: string }>
+  },
+
+  setBuiltinMcpEnabled: (workspaceSlug: string, id: string, enabled: boolean) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SET_BUILTIN_MCP_ENABLED, workspaceSlug, id, enabled)
   },
 
   getWorkspaceSkills: (workspaceSlug: string) => {

@@ -205,6 +205,8 @@ export interface AgentPendingPrompt {
 export const agentSessionsAtom = atom<AgentSessionMeta[]>([])
 export const agentWorkspacesAtom = atom<AgentWorkspace[]>([])
 export const currentAgentWorkspaceIdAtom = atom<string | null>(null)
+/** 侧栏「自动任务」合成项目组在项目列表中的位置索引（默认 0 = 最靠前；从 settings.json 加载） */
+export const automationGroupOrderAtom = atom<number>(0)
 /** 全局默认渠道 ID（新会话继承用，从 settings.json 加载） */
 export const agentChannelIdAtom = atom<string | null>(null)
 /** 全局默认模型 ID（新会话继承用，从 settings.json 加载） */
@@ -423,6 +425,23 @@ export const pendingPermissionRequestsAtom = atom(
 
 /** 待处理的 AskUser 请求 Map — 以 sessionId 为 key，切换会话时保留状态 */
 export const allPendingAskUserRequestsAtom = atom<Map<string, readonly AskUserRequest[]>>(new Map())
+
+/** AskUser 单题答案草稿 */
+export interface AskUserQuestionDraft {
+  selected: string[]
+  customText: string
+  showCustom: boolean
+}
+
+/** AskUser 请求级草稿 — 以 requestId 为 key，组件卸载后仍保留 */
+export interface AskUserRequestDraft {
+  activeTab: number
+  focusedOptIdx: number
+  answers: Map<number, AskUserQuestionDraft>
+}
+
+/** 待提交 AskUser 草稿 Map — 以 requestId 为 key，切换预览/会话时保留填写进度 */
+export const askUserDraftsAtom = atom<Map<string, AskUserRequestDraft>>(new Map())
 
 type AskUserRequestsUpdate = readonly AskUserRequest[] | ((prev: readonly AskUserRequest[]) => readonly AskUserRequest[])
 

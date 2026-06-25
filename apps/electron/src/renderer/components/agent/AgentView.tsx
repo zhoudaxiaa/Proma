@@ -49,7 +49,7 @@ import {
 import { cn } from '@/lib/utils'
 import { getActiveAccelerator, getAcceleratorDisplay } from '@/lib/shortcut-registry'
 import { registerShortcut } from '@/lib/shortcut-registry'
-import { previewPanelOpenMapAtom, autoPreviewEnabledAtom, quotedSelectionMapAtom, currentQuotedSelectionAtom } from '@/atoms/preview-atoms'
+import { previewPanelOpenMapAtom, quotedSelectionMapAtom, currentQuotedSelectionAtom } from '@/atoms/preview-atoms'
 import {
   agentStreamingStatesAtom,
   agentSessionStreamingStateAtomFamily,
@@ -218,20 +218,15 @@ function AgentThinkingPopover({ agentThinking, onToggle }: AgentThinkingPopoverP
 }
 
 interface DisplayOptionsPopoverProps {
-  autoPreviewEnabled: boolean
   processGroupsKeepExpanded: boolean
-  onAutoPreviewChange: (enabled: boolean) => void
   onProcessGroupsKeepExpandedChange: (expanded: boolean) => void
 }
 
 function DisplayOptionsPopover({
-  autoPreviewEnabled,
   processGroupsKeepExpanded,
-  onAutoPreviewChange,
   onProcessGroupsKeepExpandedChange,
 }: DisplayOptionsPopoverProps): React.ReactElement {
   const [open, setOpen] = React.useState(false)
-  const hasEnabledOption = autoPreviewEnabled || processGroupsKeepExpanded
   const hoverTimeout = React.useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const handleMouseEnter = React.useCallback(() => {
@@ -258,13 +253,13 @@ function DisplayOptionsPopover({
           size="icon"
           className={cn(
             'size-[36px] rounded-full',
-            hasEnabledOption ? 'text-green-500' : 'text-foreground/60 hover:text-foreground'
+            processGroupsKeepExpanded ? 'text-green-500' : 'text-foreground/60 hover:text-foreground'
           )}
           aria-label="显示选项"
           onMouseEnter={handleMouseEnter}
           onMouseLeave={handleMouseLeave}
         >
-          <Eye className="size-5" />
+          <Eye className={cn('size-5', processGroupsKeepExpanded && 'text-green-500')} />
         </Button>
       </PopoverTrigger>
       <PopoverContent
@@ -277,15 +272,6 @@ function DisplayOptionsPopover({
         onMouseLeave={handleMouseLeave}
       >
         <div className="flex flex-col gap-1.5">
-          <div className="flex items-center justify-between gap-4">
-            <span className="text-xs text-foreground/70">自动预览修改中文件</span>
-            <Switch
-              checked={autoPreviewEnabled}
-              onCheckedChange={onAutoPreviewChange}
-              className="h-4 w-7 [&>span]:size-3 [&>span]:data-[state=checked]:translate-x-3"
-            />
-          </div>
-          <div className="h-px bg-border" />
           <div className="flex items-center justify-between gap-4">
             <span className="text-xs text-foreground/70">输出完保持展开</span>
             <Switch
@@ -1057,6 +1043,32 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     })
   }, [setPendingFiles])
 
+  /** 图片附件编辑完成：用编辑后的图替换该附件（统一转为内存图片走 __pendingAgentFileData） */
+  const handleAttachmentEditComplete = React.useCallback((fileId: string, editedDataUrl: string): void => {
+    const base64 = editedDataUrl.split(',')[1]
+    if (!base64) return
+    if (!window.__pendingAgentFileData) {
+      window.__pendingAgentFileData = new Map<string, string>()
+    }
+    window.__pendingAgentFileData.set(fileId, base64)
+    setPendingFiles((prev) => prev.map((f) => {
+      if (f.id !== fileId) return f
+      if (f.previewUrl?.startsWith('blob:')) {
+        URL.revokeObjectURL(f.previewUrl)
+      }
+      return {
+        ...f,
+        previewUrl: editedDataUrl,
+        filename: f.filename.replace(/(\.[^.]+)?$/, '') + '_edited.png',
+        mediaType: 'image/png',
+        size: Math.round(base64.length * 0.75),
+        // 编辑后统一当作内存图片：清除文件引用，发送时从 __pendingAgentFileData 读取最新数据
+        sourcePath: undefined,
+        isClipboardDraft: undefined,
+      }
+    }))
+  }, [setPendingFiles])
+
   const openClipboardPreviewFile = React.useCallback((filePath: string): void => {
     const parentPath = getFileParentPath(filePath)
     openPreview(sessionId, {
@@ -1260,8 +1272,8 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const externalSelectedModel = computedSelectedModel ?? stableSelectedModelRef.current
 
   /** 发送消息 */
-  const handleSend = React.useCallback(async (): Promise<void> => {
-    const text = inputContent.trim()
+  const handleSend = React.useCallback(async (overrideText?: string): Promise<void> => {
+    const text = (overrideText ?? inputContent).trim()
     // 如果输入为空但有建议，使用建议内容
     const effectiveText = text || suggestion || ''
     const pendingFilesSnapshot = pendingFilesRef.current
@@ -1304,9 +1316,13 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         return map
       })
 
-      // 2. 清空输入框
-      setInputContent('')
-      setInputHtmlContent('')
+      // 2. 清空输入框（仅当发送的是用户自己输入的内容，而非推荐建议时）
+      // 用 === undefined 与上方 `overrideText ?? inputContent` 的取值语义保持一致，
+      // 避免未来出现 handleSend('') 时两条路径行为割裂
+      if (overrideText === undefined) {
+        setInputContent('')
+        setInputHtmlContent('')
+      }
       setPromptSuggestions((prev) => {
         if (!prev.has(sessionId)) return prev
         const map = new Map(prev)
@@ -1553,8 +1569,13 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       })(),
     }
 
-    setInputContent('')
-    setInputHtmlContent('')
+    // 清空输入框（仅当发送的是用户自己输入的内容，而非推荐建议时）
+    // 用 === undefined 与上方 `overrideText ?? inputContent` 的取值语义保持一致，
+    // 避免未来出现 handleSend('') 时两条路径行为割裂
+    if (overrideText === undefined) {
+      setInputContent('')
+      setInputHtmlContent('')
+    }
 
     window.electronAPI.sendAgentMessage(input).catch((error) => {
       console.error('[AgentView] 发送消息失败:', error)
@@ -2046,9 +2067,8 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     (allAskUserRequests.get(sessionId)?.length ?? 0) > 0 ||
     (allExitPlanRequests.get(sessionId)?.length ?? 0) > 0
 
-  // ===== 预览面板状态（toggle 快捷键 + auto-preview 设置，分屏布局在 MainArea） =====
+  // ===== 预览面板状态（toggle 快捷键，分屏布局在 MainArea） =====
   const setPreviewOpenMap = useSetAtom(previewPanelOpenMapAtom)
-  const [autoPreviewEnabled, setAutoPreviewEnabled] = useAtom(autoPreviewEnabledAtom)
   const [processGroupsKeepExpanded, setProcessGroupsKeepExpanded] = useAtom(agentProcessGroupsKeepExpandedAtom)
 
   const togglePreviewPanel = React.useCallback(() => {
@@ -2155,12 +2175,10 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       ),
     },
     {
-      key: 'auto-preview',
+      key: 'display-options',
       node: (
         <DisplayOptionsPopover
-          autoPreviewEnabled={autoPreviewEnabled}
           processGroupsKeepExpanded={processGroupsKeepExpanded}
-          onAutoPreviewChange={setAutoPreviewEnabled}
           onProcessGroupsKeepExpandedChange={setProcessGroupsKeepExpanded}
         />
       ),
@@ -2183,9 +2201,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     contextStatus.isCompacting,
     streaming,
     handleCompact,
-    autoPreviewEnabled,
     processGroupsKeepExpanded,
-    setAutoPreviewEnabled,
     setProcessGroupsKeepExpanded,
   ])
 
@@ -2217,7 +2233,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           ? 'text-primary hover:bg-primary/10'
           : 'text-foreground/30 cursor-not-allowed'
       )}
-      onClick={handleSend}
+      onClick={() => handleSend()}
       disabled={!canSend}
     >
       <CornerDownLeft className="size-[22px]" />
@@ -2302,6 +2318,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
                     previewUrl={file.previewUrl}
                     onRemove={() => handleRemoveFile(file.id)}
                     onClick={file.filename.startsWith('clipboard-') ? () => handleClipboardPreview(file) : undefined}
+                    onEditComplete={(editedDataUrl) => handleAttachmentEditComplete(file.id, editedDataUrl)}
                   />
                 ))}
                 {currentQuotedSelection && (
@@ -2320,7 +2337,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
                 <button
                   type="button"
                   className="group flex items-start gap-2 w-full rounded-lg border border-dashed border-primary/30 bg-primary/[0.03] px-3 py-2.5 text-left text-sm transition-colors hover:border-primary/50 hover:bg-primary/[0.06]"
-                  onClick={handleSend}
+                  onClick={() => handleSend(suggestion)}
                 >
                   <Sparkles className="size-4 shrink-0 mt-0.5 text-primary/60 group-hover:text-primary/80" />
                   <span className="flex-1 min-w-0 text-foreground/80 group-hover:text-foreground line-clamp-3">{suggestion}</span>

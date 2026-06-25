@@ -247,6 +247,7 @@ const PROVIDER_LOGO_MAP: Record<ProviderType, string> = {
   minimax: MiniMaxLogo,
   doubao: DoubaoLogo,
   qwen: QwenLogo,
+  'qwen-anthropic': QwenLogo,
   xiaomi: XiaomiLogo,
   'xiaomi-token-plan': XiaomiLogo,
   custom: DefaultLogo,
@@ -373,6 +374,20 @@ export function resolveModelDisplayName(modelId: string, channels: import('@prom
     }
   }
   return modelId
+}
+
+/**
+ * 根据模型 ID 在渠道列表中查找供应商类型
+ */
+export function resolveModelProvider(modelId: string, channels: import('@proma/shared').Channel[]): ProviderType | undefined {
+  for (const channel of channels) {
+    for (const model of channel.models) {
+      if (model.id === modelId) {
+        return channel.provider
+      }
+    }
+  }
+  return undefined
 }
 
 /** 默认模型图标 */

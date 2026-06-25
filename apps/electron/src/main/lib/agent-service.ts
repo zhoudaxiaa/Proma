@@ -26,12 +26,14 @@ import type {
   AgentQueueMessageInput,
   PromaPermissionMode,
   AgentExternalRunSource,
+  AgentMessage,
 } from '@proma/shared'
 import { ClaudeAgentAdapter, scanAndKillOrphanedClaudeSubprocesses } from './adapters/claude-agent-adapter'
 import { AgentEventBus } from './agent-event-bus'
 import { AgentOrchestrator } from './agent-orchestrator'
 import { getAgentSessionWorkspacePath, getWorkspaceFilesDir } from './config-paths'
 import { getAgentSessionMeta, updateAgentSessionMeta } from './agent-session-manager'
+import { setAgentStopper, setHeadlessAgentRunner } from './agent-headless-runner-registry'
 
 // ===== 实例创建 =====
 
@@ -41,6 +43,11 @@ const orchestrator = new AgentOrchestrator(adapter, eventBus)
 
 /** 导出 EventBus 供飞书 Bridge 等外部服务订阅事件 */
 export { eventBus as agentEventBus }
+
+// 注册协作子会话 EventBus 阻塞事件监听
+import('./agent-collaboration-tools').then(({ registerCollaborationEventBus }) => {
+  registerCollaborationEventBus(eventBus)
+}).catch(() => { /* collaboration 模块可能未加载 */ })
 
 /**
  * 会话 → webContents 映射
@@ -124,6 +131,16 @@ export async function runAgent(
   try {
     updateAgentSessionMeta(input.sessionId, { completedButUnconfirmed: false })
   } catch { /* 新会话可能尚未写入索引 */ }
+  // 自动任务会话"毕业"：用户手动发消息（非定时触发）即视为接管，标记后该会话回到普通项目列表，
+  // 调度器也不再复用它注入新的定时运行。
+  if (input.triggeredBy !== 'automation') {
+    try {
+      const meta = getAgentSessionMeta(input.sessionId)
+      if (meta?.sourceAutomationId && !meta.automationGraduated) {
+        updateAgentSessionMeta(input.sessionId, { automationGraduated: true })
+      }
+    } catch { /* 新会话可能尚未写入索引 */ }
+  }
   try {
     await orchestrator.sendMessage(input, {
       onError: (error) => {
@@ -192,7 +209,7 @@ export async function runAgentHeadless(
   input: AgentSendInput,
   callbacks: {
     onError: (error: string) => void
-    onComplete: () => void
+    onComplete: (messages?: AgentMessage[]) => void
     onTitleUpdated: (title: string) => void
     source?: AgentExternalRunSource
   },
@@ -218,7 +235,7 @@ export async function runAgentHeadless(
         }
       },
       onComplete: (messages, opts) => {
-        callbacks.onComplete()
+        callbacks.onComplete(messages)
         // 同步到渲染进程
         if (wc && !wc.isDestroyed()) {
           wc.send(AGENT_IPC_CHANNELS.STREAM_COMPLETE, {
@@ -290,6 +307,9 @@ export async function generateAgentTitle(input: AgentGenerateTitleInput): Promis
 export function stopAgent(sessionId: string): void {
   orchestrator.stop(sessionId)
 }
+
+setHeadlessAgentRunner(runAgentHeadless)
+setAgentStopper(stopAgent)
 
 /**
  * 快照回退：回退到指定消息点，恢复文件 + 截断对话

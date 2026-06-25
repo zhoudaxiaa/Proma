@@ -174,6 +174,12 @@ export const DEFAULT_THEME_MODE: ThemeMode = 'dark'
 /** 默认特殊风格 */
 export const DEFAULT_THEME_STYLE: ThemeStyle = 'default'
 
+/** 界面风格：经典保留旧版视觉，现代使用当前更克制的 UI */
+export type InterfaceVariant = 'classic' | 'modern'
+
+/** 默认界面风格 */
+export const DEFAULT_INTERFACE_VARIANT: InterfaceVariant = 'modern'
+
 /** Markdown 预览字号档位 */
 export type MarkdownFontSize = 'small' | 'medium' | 'large'
 
@@ -186,6 +192,8 @@ export interface AppSettings {
   themeMode: ThemeMode
   /** 特殊风格主题 */
   themeStyle?: ThemeStyle
+  /** 界面风格 */
+  interfaceVariant?: InterfaceVariant
   /** Agent 默认渠道 ID（仅限 Anthropic 渠道） — 当前选中的渠道 */
   agentChannelId?: string
   /** Agent 默认模型 ID */
@@ -194,6 +202,8 @@ export interface AppSettings {
   agentChannelIds?: string[]
   /** Agent 当前工作区 ID */
   agentWorkspaceId?: string
+  /** 侧栏「自动任务」合成项目组在项目列表中的位置索引（默认 0 = 最靠前；可拖拽调整） */
+  agentAutomationGroupOrder?: number
   /** 是否已完成 Onboarding 流程 */
   onboardingCompleted?: boolean
   /** 是否跳过了环境检测 */
@@ -236,6 +246,8 @@ export interface AppSettings {
   voiceDictation?: VoiceDictationPersistedSettings
   /** 飞书 Session 镜像设置：每个 Proma Session 可创建一个仅包含用户与指定 Bot 的飞书群 */
   feishuSessionMirror?: FeishuSessionMirrorSettings
+  /** 用户手动关闭的 Proma 内置 MCP ID 列表 */
+  builtinMcpDisabledIds?: string[]
   /** 启动时自动清理临时文件（proma-preview、proma-installers），默认 true */
   autoCleanupTempOnStart?: boolean
   /** 自动清理 N 天前已归档会话的 SDK 数据（0 = 禁用，默认 0） */

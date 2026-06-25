@@ -37,16 +37,18 @@ import { CopyButton } from '@/components/chat/CopyButton'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { formatMessageTime } from '@/components/chat/ChatMessageItem'
-import { getModelLogo, resolveModelDisplayName } from '@/lib/model-logo'
+import { getModelLogo, resolveModelDisplayName, resolveModelProvider } from '@/lib/model-logo'
 import { userProfileAtom } from '@/atoms/user-profile'
 import { channelsAtom } from '@/atoms/chat-atoms'
-import { agentProcessGroupsKeepExpandedAtom } from '@/atoms/agent-atoms'
+import { agentProcessGroupsKeepExpandedAtom, agentSessionPendingFilesAtom } from '@/atoms/agent-atoms'
 import { agentSessionsAtom } from '@/atoms/agent-atoms'
 import { activeSessionIdAtom } from '@/atoms/tab-atoms'
 import { automationsAtom, automationFormAtom, automationToDraft } from '@/atoms/automation-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
 import { environmentCheckDialogOpenAtom } from '@/atoms/environment'
 import { settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
+import { useOpenPreview } from '@/components/diff/preview-opener'
+import { getFileParentPath } from '@/lib/file-utils'
 import type {
   SDKMessage,
   SDKAssistantMessage,
@@ -59,6 +61,7 @@ import type {
   SDKToolResultBlock,
   RecoveryAction,
 } from '@proma/shared'
+import type { AgentPendingFile } from '@proma/shared'
 import {
   THINKING_SIGNATURE_ERROR_CODE,
   THINKING_SIGNATURE_ERROR_TITLE,
@@ -239,10 +242,11 @@ function isUserInputMessage(message: SDKUserMessage): boolean {
 // ===== 助手头像 =====
 
 function AssistantLogo({ model }: { model?: string }): React.ReactElement {
+  const channels = useAtomValue(channelsAtom)
   if (model) {
     return (
       <img
-        src={getModelLogo(model)}
+        src={getModelLogo(model, resolveModelProvider(model, channels))}
         alt={model}
         className="size-[35px] rounded-[25%] object-cover"
       />
@@ -923,7 +927,7 @@ export function isImageFile(filename: string): boolean {
 }
 
 /** 图片附件缩略图，点击可预览大图 */
-function AttachedImageThumb({ file }: { file: AttachedFileRef }): React.ReactElement {
+function AttachedImageThumb({ file, onEditComplete }: { file: AttachedFileRef; onEditComplete?: (editedDataUrl: string) => void }): React.ReactElement {
   const [imageSrc, setImageSrc] = React.useState<string | null>(null)
   const [lightboxOpen, setLightboxOpen] = React.useState(false)
 
@@ -971,6 +975,7 @@ function AttachedImageThumb({ file }: { file: AttachedFileRef }): React.ReactEle
         open={lightboxOpen}
         onOpenChange={setLightboxOpen}
         onSave={handleSave}
+        onEditComplete={onEditComplete}
       />
     </div>
   )
@@ -980,12 +985,34 @@ function AttachedImageThumb({ file }: { file: AttachedFileRef }): React.ReactEle
 function AttachedFileChip({ file }: { file: AttachedFileRef }): React.ReactElement {
   const isImg = isImageFile(file.filename)
   const Icon = isImg ? FileImage : FileText
+  const activeSessionId = useAtomValue(activeSessionIdAtom)
+  const openPreview = useOpenPreview()
+
+  const handleOpenPreview = React.useCallback((): void => {
+    if (!activeSessionId) return
+    const parentPath = getFileParentPath(file.path)
+    openPreview(activeSessionId, {
+      filePath: file.path,
+      previewOnly: true,
+      readOnly: true,
+      basePaths: parentPath ? [parentPath] : undefined,
+    })
+  }, [activeSessionId, file.path, openPreview])
 
   return (
-    <div className="inline-flex items-center gap-1.5 rounded-md bg-muted/60 px-2.5 py-1 text-[12px] text-muted-foreground">
+    <button
+      type="button"
+      onClick={handleOpenPreview}
+      disabled={!activeSessionId}
+      className={cn(
+        'inline-flex items-center gap-1.5 rounded-md bg-muted/60 px-2.5 py-1 text-[12px] text-muted-foreground',
+        'transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:hover:bg-muted/60 disabled:hover:text-muted-foreground'
+      )}
+      title={file.path}
+    >
       <Icon className="size-3.5 shrink-0" />
       <span className="truncate max-w-[200px]">{file.filename}</span>
-    </div>
+    </button>
   )
 }
 
@@ -1048,8 +1075,36 @@ function UserInputMessage({ message, onEdit }: { message: SDKUserMessage; onEdit
   const isScheduledRun = rawText.includes(SCHEDULED_RUN_MARKER)
   const { files: attachedFiles, quotes, text } = parseAttachedFiles(stripScheduledRunMarker(rawText))
   const imageFiles = attachedFiles.filter((f) => isImageFile(f.filename))
+  const activeSessionId = useAtomValue(activeSessionIdAtom)
+  const setSessionPendingFiles = useSetAtom(agentSessionPendingFilesAtom)
   const nonImageFiles = attachedFiles.filter((f) => !isImageFile(f.filename))
   const meta = extractMeta(message as unknown as SDKMessage)
+
+  const handleImageEditComplete = React.useCallback((editedDataUrl: string): void => {
+    const base64 = editedDataUrl.split(',')[1]
+    if (!base64 || !activeSessionId) return
+
+    const id = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const pending: AgentPendingFile = {
+      id,
+      filename: `edited_image_${Date.now()}.png`,
+      mediaType: 'image/png',
+      size: Math.round(base64.length * 0.75),
+      previewUrl: editedDataUrl,
+    }
+
+    if (!window.__pendingAgentFileData) {
+      window.__pendingAgentFileData = new Map()
+    }
+    window.__pendingAgentFileData.set(id, base64)
+
+    setSessionPendingFiles((prev) => {
+      const sessionFiles = prev.get(activeSessionId) ?? []
+      const map = new Map(prev)
+      map.set(activeSessionId, [...sessionFiles, pending])
+      return map
+    })
+  }, [activeSessionId, setSessionPendingFiles])
 
   return (
     <Message from="user">
@@ -1082,7 +1137,7 @@ function UserInputMessage({ message, onEdit }: { message: SDKUserMessage; onEdit
         {imageFiles.length > 0 && (
           <div className="flex flex-wrap gap-2.5 mb-2 justify-end">
             {imageFiles.map((file) => (
-              <AttachedImageThumb key={file.path} file={file} />
+              <AttachedImageThumb key={file.path} file={file} onEditComplete={handleImageEditComplete} />
             ))}
           </div>
         )}

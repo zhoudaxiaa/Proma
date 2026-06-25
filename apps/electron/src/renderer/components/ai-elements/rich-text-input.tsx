@@ -408,8 +408,13 @@ export function RichTextInput({
             return false
           }
 
-          // Mention 列表打开且有可选项时，让 TipTap Mention 处理 Enter
-          if (mentionActiveRef.current && mentionItemCountRef.current > 0) {
+          // Suggestion（@ 文件 / / Skill / # MCP / & 会话）弹窗激活时，让 TipTap Suggestion
+          // 插件处理 Enter（选中高亮项 / 关闭）。这里用实时 decoration 判定，而非 onStart 里
+          // 异步设置的 mentionActiveRef/mentionItemCountRef——后者要等 items() 异步加载
+          // （IPC 拉取工作区能力）resolve 后才置位，存在竞态窗口：插件已 active、补全列表
+          // 正在加载时按 Enter，旧逻辑会误判为无 mention 激活而把消息直接发送出去。
+          // data-decoration-id 由 @tiptap/suggestion 在 active 时同步渲染，与插件状态严格一致。
+          if (view.dom.querySelector('[data-decoration-id]')) {
             return false
           }
 
@@ -422,7 +427,7 @@ export function RichTextInput({
             return true
           }
 
-          // 换行：列表内延续列表项，其他场景插入硬换行（紧凑行距）
+          // 换行：普通段落中 Shift+Enter 插入硬换行；列表项内使用拆分列表项生成下一条。
           event.preventDefault()
           // 检查是否在列表项内（遍历祖先节点）
           let isInList = false
@@ -439,10 +444,17 @@ export function RichTextInput({
             if (listItemNode && listItemNode.textContent === '') {
               editor.chain().focus().liftListItem('listItem').run()
             } else {
+              // 发送模式下 Enter 会提交消息，因此 Shift+Enter 也应作为列表续项键。
               editor.chain().focus().splitListItem('listItem').run()
             }
           } else if (editor) {
-            editor.chain().focus().splitBlock().run()
+            if (hasShift) {
+              // Shift+Enter：同段落内硬换行
+              editor.chain().focus().setHardBreak().run()
+            } else {
+              // 普通 Enter：拆分为新段落
+              editor.chain().focus().splitBlock().run()
+            }
           }
           return true
         }
