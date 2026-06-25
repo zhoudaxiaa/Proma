@@ -109,6 +109,11 @@ import { wechatBridge } from './lib/wechat-bridge'
 import { getWeChatConfig } from './lib/wechat-config'
 import { createQuickTaskWindow, toggleQuickTaskWindow, destroyQuickTaskWindow } from './lib/quick-task-window'
 import {
+  createMiniChatWindow,
+  toggleMiniChatWindow,
+  destroyMiniChatWindow,
+} from './lib/mini-chat-window'
+import {
   createVoiceDictationWindow,
   toggleVoiceDictationWindow,
   destroyVoiceDictationWindow,
@@ -545,6 +550,8 @@ async function bootstrap(): Promise<void> {
 
   // 预创建快速任务窗口（隐藏状态，首次唤起秒开）
   safeRun('createQuickTaskWindow', createQuickTaskWindow)
+  // 预创建 Mini Chat 窗口（隐藏状态，首次唤起秒开）
+  safeRun('createMiniChatWindow', createMiniChatWindow)
   if (getSettings().voiceDictation?.enabled === true) {
     safeRun('createVoiceDictationWindow', createVoiceDictationWindow)
   }
@@ -558,6 +565,9 @@ async function bootstrap(): Promise<void> {
   )
   safeRun('registerGlobalShortcut:show-main-window', () =>
     registerGlobalShortcut('show-main-window', showAndFocusMainWindow),
+  )
+  safeRun('registerGlobalShortcut:mini-chat', () =>
+    registerGlobalShortcut('mini-chat', toggleMiniChatWindow),
   )
   safeRun('registerGlobalShortcut:voice-dictation', () =>
     registerGlobalShortcut('voice-dictation', () => {
@@ -672,6 +682,7 @@ app.on('before-quit', () => {
   unregisterAllGlobalShortcuts()
   // 销毁快速任务窗口
   destroyQuickTaskWindow()
+  destroyMiniChatWindow()
   destroyVoiceDictationWindow()
   // Clean up system tray before quitting
   destroyTray()

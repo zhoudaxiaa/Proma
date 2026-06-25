@@ -125,8 +125,10 @@ import type {
   MicPermissionResult,
   TrayCreateSessionData,
   TrayOpenAgentSessionData,
+  MiniChatSubmitInput,
+  MiniChatExpandData,
 } from '../types'
-import { QUICK_TASK_IPC_CHANNELS, TRAY_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS } from '../types'
+import { QUICK_TASK_IPC_CHANNELS, MINI_CHAT_IPC_CHANNELS, TRAY_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS } from '../types'
 
 /**
  * 暴露给渲染进程的 API 接口定义
@@ -730,6 +732,9 @@ export interface ElectronAPI {
   /** 截图导出：将 HTML 渲染为 PNG 并复制到剪贴板或保存文件 */
   screenshotCapture: (input: { html: string; isDark: boolean; width?: number; mode: 'clipboard' | 'file'; css?: string; themeClass?: string }) => Promise<{ success: boolean; message: string; filePath?: string }>
 
+  /** 系统截图：调用系统原生截图工具截取屏幕，返回截图文件路径和 base64 数据 */
+  systemScreenshot: () => Promise<{ success: boolean; filePath?: string; base64?: string; error?: string }>
+
   /** 重命名文件/目录 */
   renameFile: (filePath: string, newName: string) => Promise<void>
 
@@ -934,6 +939,21 @@ export interface ElectronAPI {
   onQuickTaskFocus: (callback: () => void) => () => void
   /** 订阅快速任务打开会话事件（主窗口接收，由渲染进程负责创建会话） */
   onQuickTaskOpenSession: (callback: (data: QuickTaskOpenSessionData) => void) => () => void
+
+  // ===== Mini Chat 窗口 =====
+
+  /** 提交 Mini Chat 消息 */
+  submitMiniChat: (input: MiniChatSubmitInput) => Promise<void>
+  /** 隐藏 Mini Chat 窗口 */
+  hideMiniChat: () => Promise<void>
+  /** 展开 Mini Chat 对话到主窗口 */
+  expandMiniChat: (data: MiniChatExpandData) => Promise<void>
+  /** 创建新对话（返回 conversationId） */
+  newMiniChatConversation: () => Promise<string>
+  /** 订阅 Mini Chat 窗口聚焦事件 */
+  onMiniChatFocus: (callback: () => void) => () => void
+  /** 订阅 Mini Chat 展开到主窗口事件（主窗口接收） */
+  onMiniChatExpandSession: (callback: (data: MiniChatExpandData) => void) => () => void
 
   // ===== 语音输入 =====
 
@@ -1860,6 +1880,10 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(IPC_CHANNELS.SCREENSHOT_CAPTURE, input) as Promise<{ success: boolean; message: string; filePath?: string }>
   },
 
+  systemScreenshot: () => {
+    return ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_SCREENSHOT) as Promise<{ success: boolean; filePath?: string; base64?: string; error?: string }>
+  },
+
   renameFile: (filePath: string, newName: string) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.RENAME_FILE, filePath, newName)
   },
@@ -2182,6 +2206,36 @@ const electronAPI: ElectronAPI = {
     const listener = (_: unknown, data: QuickTaskOpenSessionData): void => callback(data)
     ipcRenderer.on('quick-task:open-session', listener)
     return () => { ipcRenderer.removeListener('quick-task:open-session', listener) }
+  },
+
+  // ===== Mini Chat 窗口 =====
+
+  submitMiniChat: (input: MiniChatSubmitInput) => {
+    return ipcRenderer.invoke(MINI_CHAT_IPC_CHANNELS.SUBMIT, input)
+  },
+
+  hideMiniChat: () => {
+    return ipcRenderer.invoke(MINI_CHAT_IPC_CHANNELS.HIDE)
+  },
+
+  expandMiniChat: (data: MiniChatExpandData) => {
+    return ipcRenderer.invoke(MINI_CHAT_IPC_CHANNELS.EXPAND, data)
+  },
+
+  newMiniChatConversation: () => {
+    return ipcRenderer.invoke(MINI_CHAT_IPC_CHANNELS.NEW_CONVERSATION)
+  },
+
+  onMiniChatFocus: (callback: () => void) => {
+    const listener = (): void => callback()
+    ipcRenderer.on(MINI_CHAT_IPC_CHANNELS.FOCUS, listener)
+    return () => { ipcRenderer.removeListener(MINI_CHAT_IPC_CHANNELS.FOCUS, listener) }
+  },
+
+  onMiniChatExpandSession: (callback: (data: MiniChatExpandData) => void) => {
+    const listener = (_: unknown, data: MiniChatExpandData): void => callback(data)
+    ipcRenderer.on('mini-chat:expand-session', listener)
+    return () => { ipcRenderer.removeListener('mini-chat:expand-session', listener) }
   },
 
   // ===== 语音输入 =====

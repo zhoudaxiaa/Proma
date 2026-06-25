@@ -80,6 +80,7 @@ import 'katex/dist/katex.min.css'
 const isQuickTaskWindow = new URLSearchParams(window.location.search).get('window') === 'quick-task'
 const isVoiceDictationWindow = new URLSearchParams(window.location.search).get('window') === 'voice-dictation'
 const isDetachedPreviewWindow = new URLSearchParams(window.location.search).get('window') === 'detached-preview'
+const isMiniChatWindow = new URLSearchParams(window.location.search).get('window') === 'mini-chat'
 
 /**
  * 主题初始化组件
@@ -929,6 +930,17 @@ if (isQuickTaskWindow) {
         <ThemeInitializer />
         <MarkdownFontSizeInitializer />
         <DetachedPreviewApp />
+        <Toaster position="top-right" />
+      </React.StrictMode>
+    )
+  })
+} else if (isMiniChatWindow) {
+  import('./components/mini-chat/MiniChatApp').then(({ MiniChatApp }) => {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <ThemeInitializer />
+        <ChatToolInitializer />
+        <MiniChatApp />
         <Toaster position="top-right" />
       </React.StrictMode>
     )

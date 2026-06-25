@@ -445,9 +445,25 @@ export function GlobalShortcuts(): null {
       }
     })
 
+    const cleanupMiniChatExpand = window.electronAPI.onMiniChatExpandSession((data) => {
+      store.set(appModeAtom, 'chat')
+      store.set(activeViewAtom, 'conversations')
+      store.set(currentConversationIdAtom, data.conversationId)
+
+      const currentTabs = store.get(tabsAtom)
+      const result = openTab(currentTabs, {
+        type: 'chat',
+        sessionId: data.conversationId,
+        title: data.title || 'Mini Chat',
+      })
+      store.set(tabsAtom, result.tabs)
+      store.set(activeTabIdAtom, result.activeTabId)
+    })
+
     return () => {
       cleanupOpen()
       cleanupCreate()
+      cleanupMiniChatExpand()
     }
   }, [store, createAgent, createChat])
   return null

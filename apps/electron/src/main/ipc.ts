@@ -10,9 +10,11 @@ import { existsSync, realpathSync, rmSync, readFileSync, writeFileSync, mkdirSyn
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, MEMORY_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, isPromaPermissionMode, normalizePathForCompare } from '@proma/shared'
-import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS } from '../types'
+import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, MINI_CHAT_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS } from '../types'
 import type {
   QuickTaskSubmitInput,
+  MiniChatSubmitInput,
+  MiniChatExpandData,
   VoiceDictationAudioChunkInput,
   VoiceDictationCommitInput,
   VoiceDictationCommitResult,
@@ -965,6 +967,61 @@ export function registerIpcHandlers(): void {
     async (_, input: { html: string; isDark: boolean; width?: number; mode: 'clipboard' | 'file'; css?: string; themeClass?: string }) => {
       const { captureScreenshot } = await import('./lib/screenshot-service')
       return captureScreenshot(input)
+    }
+  )
+
+  // 系统截图：调用系统原生截图工具
+  ipcMain.handle(
+    IPC_CHANNELS.SYSTEM_SCREENSHOT,
+    async (): Promise<{ success: boolean; filePath?: string; base64?: string; error?: string }> => {
+      try {
+        const { execFile } = await import('node:child_process')
+        const { promisify } = await import('node:util')
+        const { readFileSync, existsSync, unlinkSync } = await import('node:fs')
+        const { tmpdir } = await import('node:os')
+        const execFileAsync = promisify(execFile)
+
+        // 隐藏 Mini Chat 窗口，避免截到自身
+        const { hideMiniChatWindow } = await import('./lib/mini-chat-window')
+        hideMiniChatWindow()
+        // 等待窗口完全隐藏
+        await new Promise((r) => setTimeout(r, 500))
+
+        const platform = process.platform
+        if (platform === 'darwin') {
+          // macOS: 使用 screencapture -i（交互式区域选择），保存到临时文件
+          // -o 不捕获窗口阴影
+          const tmpPath = `${tmpdir()}/proma-screenshot-${Date.now()}.png`
+          await execFileAsync('/usr/sbin/screencapture', ['-i', '-o', tmpPath])
+          // 用户取消截图时文件不会生成
+          if (!existsSync(tmpPath)) {
+            return { success: false, error: '用户取消了截图' }
+          }
+          // 直接读取为 base64 返回（避免渲染进程路径校验问题）
+          const base64 = readFileSync(tmpPath).toString('base64')
+          // 读取后清理临时文件
+          try { unlinkSync(tmpPath) } catch { /* 忽略 */ }
+          return { success: true, filePath: tmpPath, base64 }
+        } else if (platform === 'win32') {
+          const tmpPath = `${tmpdir()}\\proma-screenshot-${Date.now()}.png`
+          await execFileAsync('powershell.exe', [
+            '-NoProfile',
+            '-Command',
+            `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{PRTSC}'); Start-Sleep -Milliseconds 500; $img = [Windows.Forms.Clipboard]::GetImage(); $img.Save('${tmpPath}')`,
+          ])
+          if (!existsSync(tmpPath)) {
+            return { success: false, error: '截图失败' }
+          }
+          const base64 = readFileSync(tmpPath).toString('base64')
+          try { unlinkSync(tmpPath) } catch { /* 忽略 */ }
+          return { success: true, filePath: tmpPath, base64 }
+        } else {
+          return { success: false, error: '不支持的操作系统' }
+        }
+      } catch (err) {
+        console.error('[系统截图] 失败:', err)
+        return { success: false, error: String(err) }
+      }
     }
   )
 
@@ -4016,6 +4073,105 @@ export function registerIpcHandlers(): void {
     async (): Promise<Record<string, boolean>> => {
       const { reregisterAllGlobalShortcuts } = await import('./lib/global-shortcut-service')
       return reregisterAllGlobalShortcuts()
+    }
+  )
+
+  // ===== Mini Chat 窗口 =====
+
+  // 提交 Mini Chat 消息
+  // 将消息发送到 chat-service，流式事件会推送到 Mini Chat 窗口
+  ipcMain.handle(
+    MINI_CHAT_IPC_CHANNELS.SUBMIT,
+    async (_, input: MiniChatSubmitInput): Promise<void> => {
+      const { getMiniChatWindow } = await import('./lib/mini-chat-window')
+      const { sendMessage } = await import('./lib/chat-service')
+      const { createConversation, getConversationMessages } = await import('./lib/conversation-manager')
+      const { saveAttachment } = await import('./lib/attachment-service')
+
+      let conversationId = input.conversationId
+      if (!conversationId) {
+        const conv = await createConversation()
+        conversationId = conv.id
+      }
+
+      // 处理附件：base64 → saveAttachment → FileAttachment
+      const savedAttachments: import('@proma/shared').FileAttachment[] = []
+      if (input.files && input.files.length > 0) {
+        for (const file of input.files) {
+          if (file.base64) {
+            try {
+              const result = saveAttachment({
+                conversationId,
+                filename: file.filename,
+                mediaType: file.mediaType,
+                data: file.base64,
+              })
+              savedAttachments.push(result.attachment)
+            } catch (err) {
+              console.error('[Mini Chat] 保存附件失败:', err)
+            }
+          } else if (file.sourcePath) {
+            savedAttachments.push({
+              id: crypto.randomUUID(),
+              filename: file.filename,
+              mediaType: file.mediaType,
+              localPath: file.sourcePath,
+              size: file.size,
+            })
+          }
+        }
+      }
+
+      // 获取消息历史
+      const messages = await getConversationMessages(conversationId)
+
+      const chatInput: import('@proma/shared').ChatSendInput = {
+        conversationId,
+        userMessage: input.text,
+        messageHistory: messages,
+        channelId: input.channelId || '',
+        modelId: input.modelId || '',
+        thinkingEnabled: input.thinkingEnabled,
+        attachments: savedAttachments.length > 0 ? savedAttachments : undefined,
+      }
+
+      const win = getMiniChatWindow()
+      if (win && !win.isDestroyed()) {
+        await sendMessage(chatInput, win.webContents)
+      }
+    }
+  )
+
+  // 隐藏 Mini Chat 窗口
+  ipcMain.handle(
+    MINI_CHAT_IPC_CHANNELS.HIDE,
+    async (): Promise<void> => {
+      const { hideMiniChatWindow } = await import('./lib/mini-chat-window')
+      hideMiniChatWindow()
+    }
+  )
+
+  // 展开 Mini Chat 对话到主窗口
+  ipcMain.handle(
+    MINI_CHAT_IPC_CHANNELS.EXPAND,
+    async (_, data: MiniChatExpandData): Promise<void> => {
+      const { getMainWindow } = await import('./index')
+      const mainWin = getMainWindow()
+      if (mainWin && !mainWin.isDestroyed()) {
+        mainWin.webContents.send('mini-chat:expand-session', data)
+        mainWin.show()
+        mainWin.focus()
+      }
+    }
+  )
+
+  // Mini Chat 创建新对话（返回新 conversationId）
+  ipcMain.handle(
+    MINI_CHAT_IPC_CHANNELS.NEW_CONVERSATION,
+    async (): Promise<string> => {
+      const { createConversation } = await import('./lib/conversation-manager')
+      const conv = await createConversation()
+      return conv.id
     }
   )
 

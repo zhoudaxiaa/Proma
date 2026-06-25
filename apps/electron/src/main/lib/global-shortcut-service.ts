@@ -23,6 +23,7 @@ const GLOBAL_SHORTCUT_DEFAULTS: Record<string, { mac: string; win: string }> = {
   'quick-task': { mac: 'Alt+Space', win: 'Alt+Space' },
   'show-main-window': { mac: 'CommandOrControl+Shift+P', win: 'CommandOrControl+Shift+P' },
   'voice-dictation': { mac: 'Ctrl+`', win: 'Ctrl+`' },
+  'mini-chat': { mac: 'Ctrl+Space', win: 'Control+Space' },
 }
 
 const isMac = process.platform === 'darwin'

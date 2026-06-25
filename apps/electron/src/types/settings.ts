@@ -308,6 +308,22 @@ export const QUICK_TASK_IPC_CHANNELS = {
   REREGISTER_GLOBAL_SHORTCUTS: 'quick-task:reregister-global-shortcuts',
 } as const
 
+/** Mini Chat 窗口 IPC 通道 */
+export const MINI_CHAT_IPC_CHANNELS = {
+  /** 提交消息（渲染进程 → 主进程 → chat-service） */
+  SUBMIT: 'mini-chat:submit',
+  /** 隐藏 Mini Chat 窗口 */
+  HIDE: 'mini-chat:hide',
+  /** 通知渲染进程聚焦输入框 */
+  FOCUS: 'mini-chat:focus',
+  /** 展开 Mini Chat 对话到主窗口 */
+  EXPAND: 'mini-chat:expand',
+  /** 创建新对话 */
+  NEW_CONVERSATION: 'mini-chat:new-conversation',
+  /** 重新注册全局快捷键（设置变更后） */
+  REREGISTER_GLOBAL_SHORTCUTS: 'mini-chat:reregister-global-shortcuts',
+} as const
+
 /** 语音输入 IPC 通道 */
 export const VOICE_DICTATION_IPC_CHANNELS = {
   /** 获取语音输入设置 */
@@ -372,6 +388,30 @@ export interface QuickTaskOpenSessionData {
   mode: 'chat' | 'agent'
   text: string
   files?: QuickTaskFile[]
+}
+
+/** Mini Chat 提交输入 */
+export interface MiniChatSubmitInput {
+  /** 消息文本 */
+  text: string
+  /** 对话 ID（为空则自动创建） */
+  conversationId?: string
+  /** 附件列表 */
+  files?: QuickTaskFile[]
+  /** 渠道 ID（模型选择） */
+  channelId?: string
+  /** 模型 ID */
+  modelId?: string
+  /** 是否开启思考模式 */
+  thinkingEnabled?: boolean
+}
+
+/** Mini Chat 展开到主窗口数据 */
+export interface MiniChatExpandData {
+  /** 要展开的对话 ID */
+  conversationId: string
+  /** 对话标题 */
+  title: string
 }
 
 /** 菜单栏打开 Agent 会话事件 */
