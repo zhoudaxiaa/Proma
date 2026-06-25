@@ -378,6 +378,8 @@ export const IPC_CHANNELS = {
   WINDOW_IS_MAXIMIZED: 'window:is-maximized',
   /** 截图导出：将 HTML 渲染为 PNG 图片 */
   SCREENSHOT_CAPTURE: 'screenshot:capture',
+  /** 系统截图：调用系统原生截图工具截取屏幕 */
+  SYSTEM_SCREENSHOT: 'screenshot:system',
 } as const
 
 /**
