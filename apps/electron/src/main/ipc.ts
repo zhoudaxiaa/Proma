@@ -59,7 +59,9 @@ import type {
   StopTaskInput,
   WorkspaceMcpConfig,
   SkillMeta,
+  SkillFileContent,
   WorkspaceCapabilities,
+  WorkspaceMemorySummary,
   FileEntry,
   FileSearchResult,
   EnvironmentCheckResult,
@@ -78,7 +80,6 @@ import type {
   SystemPrompt,
   SystemPromptCreateInput,
   SystemPromptUpdateInput,
-  MemoryConfig,
   ChatToolInfo,
   ChatToolState,
   ChatToolMeta,
@@ -194,6 +195,7 @@ import { permissionService } from './lib/agent-permission-service'
 import { askUserService } from './lib/agent-ask-user-service'
 import { exitPlanService } from './lib/agent-exit-plan-service'
 import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getWorkspaceSkillsDir, getWorkspaceFilesDir, getScratchPadPath } from './lib/config-paths'
+import { getCachedDefaultAppInfo, saveCachedDefaultAppInfo } from './lib/default-app-cache'
 import { calculateStorageStats, cleanupStorage, cleanupTempFiles } from './lib/storage-service'
 import type { CleanupOptions } from './lib/storage-service'
 import {
@@ -222,6 +224,12 @@ import {
   createSkillEntry,
   deleteSkillEntry,
   renameSkillEntry,
+  getWorkspaceMemorySummary,
+  readWorkspaceClaudeMd,
+  writeWorkspaceClaudeMd,
+  listWorkspaceAutoMemoryFiles,
+  readWorkspaceAutoMemoryFile,
+  writeWorkspaceAutoMemoryFile,
   getWorkspaceAttachedDirectories,
   getWorkspaceAttachedFiles,
   attachWorkspaceDirectory,
@@ -233,7 +241,6 @@ import {
   removeWorktreeRepo,
   cleanupStaleWorkspaceAttachedPaths,
 } from './lib/agent-workspace-manager'
-import { getMemoryConfig, setMemoryConfig } from './lib/memory-service'
 import { getAllToolInfos } from './lib/chat-tool-registry'
 import { updateToolState, updateToolCredentials, getToolCredentials, addCustomTool, deleteCustomTool } from './lib/chat-tool-config'
 import {
@@ -372,6 +379,11 @@ function getAllowedCandidateBasePaths(options?: FileAccessOptions): string[] | u
   return allowed.length > 0 ? allowed : undefined
 }
 
+function getPreviewCandidateBasePaths(options?: FileAccessOptions): string[] | undefined {
+  const bases = options?.candidateBasePaths?.filter((p) => typeof p === 'string' && p.length > 0) ?? []
+  return bases.length > 0 ? bases : undefined
+}
+
 async function getAccessRootMainRepo(root: string): Promise<string | null> {
   if (!existsSync(root)) return null
   let probePath = root
@@ -446,10 +458,12 @@ function getBundledResourcesDir(): string {
 }
 
 /**
- * 默认 App 探测结果按文件后缀缓存（含 null 负缓存），避免反复 spawn osascript / 注册表查询。
- * 进程级别一次会话足够，无需失效策略——用户切换默认 App 是低频行为，下次重启生效即可。
+ * 默认 App 探测结果按文件后缀缓存，避免反复 spawn Swift / 注册表查询。
+ * 成功结果会落盘；失败只做短暂内存冷却，避免一次瞬时失败导致整会话都隐藏按钮。
  */
-const defaultAppCache = new Map<string, import('@proma/shared').DefaultAppInfo | null>()
+const defaultAppCache = new Map<string, import('@proma/shared').DefaultAppInfo>()
+const defaultAppFailureCache = new Map<string, number>()
+const DEFAULT_APP_FAILURE_RETRY_MS = 60_000
 
 function extOf(filePath: string): string {
   const base = filePath.split(/[\\/]/).pop() ?? ''
@@ -715,7 +729,12 @@ async function getDefaultAppInfoForFile(
   const absPath = resolve(filePath)
 
   const cacheKey = `${process.platform}:${extOf(filePath) || filePath}`
-  if (defaultAppCache.has(cacheKey)) return defaultAppCache.get(cacheKey) ?? null
+  const cachedInfo = defaultAppCache.get(cacheKey) ?? getCachedDefaultAppInfo(cacheKey)
+  if (cachedInfo) {
+    defaultAppCache.set(cacheKey, cachedInfo)
+    return cachedInfo
+  }
+  if (isFailureCacheFresh(cacheKey)) return null
 
   let appPath = ''
   let appName = ''
@@ -738,6 +757,7 @@ if let appUrl = NSWorkspace.shared.urlForApplication(toOpen: url) {
     if (r.status === 0) {
       appPath = r.stdout.trim().replace(/\/$/, '')
     }
+    console.log('[DefaultApp] darwin swift 结果: status=%s appPath=%s', r.status, appPath)
     if (appPath.endsWith('.app')) {
       const base = appPath.split('/').pop() || ''
       appName = base.replace(/\.app$/, '')
@@ -782,11 +802,21 @@ if let appUrl = NSWorkspace.shared.urlForApplication(toOpen: url) {
 
   const info: import('@proma/shared').DefaultAppInfo = { name: appName, appPath, iconDataUrl }
   defaultAppCache.set(cacheKey, info)
+  defaultAppFailureCache.delete(cacheKey)
+  saveCachedDefaultAppInfo(cacheKey, info)
   return info
 }
 
+function isFailureCacheFresh(key: string): boolean {
+  const failedAt = defaultAppFailureCache.get(key)
+  if (failedAt === undefined) return false
+  if (Date.now() - failedAt < DEFAULT_APP_FAILURE_RETRY_MS) return true
+  defaultAppFailureCache.delete(key)
+  return false
+}
+
 function cacheNull(key: string): null {
-  defaultAppCache.set(key, null)
+  defaultAppFailureCache.set(key, Date.now())
   return null
 }
 
@@ -2214,6 +2244,50 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  // ===== 工作区记忆文件管理 =====
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.GET_WORKSPACE_MEMORY_SUMMARY,
+    async (_, workspaceSlug: string): Promise<WorkspaceMemorySummary> => {
+      return getWorkspaceMemorySummary(workspaceSlug)
+    }
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.READ_WORKSPACE_CLAUDE_MD,
+    async (_, workspaceSlug: string): Promise<SkillFileContent> => {
+      return readWorkspaceClaudeMd(workspaceSlug)
+    }
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.WRITE_WORKSPACE_CLAUDE_MD,
+    async (_, workspaceSlug: string, content: string): Promise<void> => {
+      writeWorkspaceClaudeMd(workspaceSlug, content)
+    }
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.LIST_WORKSPACE_AUTO_MEMORY_FILES,
+    async (_, workspaceSlug: string) => {
+      return listWorkspaceAutoMemoryFiles(workspaceSlug)
+    }
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.READ_WORKSPACE_AUTO_MEMORY_FILE,
+    async (_, workspaceSlug: string, relativePath: string): Promise<SkillFileContent> => {
+      return readWorkspaceAutoMemoryFile(workspaceSlug, relativePath)
+    }
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.WRITE_WORKSPACE_AUTO_MEMORY_FILE,
+    async (_, workspaceSlug: string, relativePath: string, content: string): Promise<void> => {
+      writeWorkspaceAutoMemoryFile(workspaceSlug, relativePath, content)
+    }
+  )
+
   // 发送 Agent 消息（触发 Agent SDK 流式响应）
   ipcMain.handle(
     AGENT_IPC_CHANNELS.SEND_MESSAGE,
@@ -2331,43 +2405,6 @@ export function registerIpcHandlers(): void {
     }
   )
 
-  // 全局记忆配置
-  ipcMain.handle(
-    MEMORY_IPC_CHANNELS.GET_CONFIG,
-    async (): Promise<MemoryConfig> => {
-      return getMemoryConfig()
-    }
-  )
-
-  ipcMain.handle(
-    MEMORY_IPC_CHANNELS.SET_CONFIG,
-    async (_, config: MemoryConfig): Promise<void> => {
-      setMemoryConfig(config)
-    }
-  )
-
-  ipcMain.handle(
-    MEMORY_IPC_CHANNELS.TEST_CONNECTION,
-    async (): Promise<{ success: boolean; message: string }> => {
-      const config = getMemoryConfig()
-      if (!config.apiKey) {
-        return { success: false, message: '请先填写 API Key' }
-      }
-      try {
-        const { searchMemory } = await import('./lib/memos-client')
-        const result = await searchMemory(
-          { apiKey: config.apiKey, userId: config.userId?.trim() || 'proma-user', baseUrl: config.baseUrl },
-          'test connection',
-          1,
-        )
-        return { success: true, message: `连接成功，已检索到 ${result.facts.length} 条事实、${result.preferences.length} 条偏好` }
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error)
-        return { success: false, message: `连接失败: ${msg}` }
-      }
-    }
-  )
-
   // ===== Chat 工具管理 =====
 
   // 获取所有工具信息
@@ -2422,25 +2459,6 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     CHAT_TOOL_IPC_CHANNELS.TEST_TOOL,
     async (_, toolId: string): Promise<{ success: boolean; message: string }> => {
-      // 记忆工具复用现有测试逻辑
-      if (toolId === 'memory') {
-        const config = getMemoryConfig()
-        if (!config.apiKey) {
-          return { success: false, message: '请先填写 API Key' }
-        }
-        try {
-          const { searchMemory } = await import('./lib/memos-client')
-          const result = await searchMemory(
-            { apiKey: config.apiKey, userId: config.userId?.trim() || 'proma-user', baseUrl: config.baseUrl },
-            'test connection',
-            1,
-          )
-          return { success: true, message: `连接成功，已检索到 ${result.facts.length} 条事实、${result.preferences.length} 条偏好` }
-        } catch (error) {
-          const msg = error instanceof Error ? error.message : String(error)
-          return { success: false, message: `连接失败: ${msg}` }
-        }
-      }
       // 联网搜索工具测试
       if (toolId === 'web-search') {
         const { getToolCredentials: getCredentials } = await import('./lib/chat-tool-config')
@@ -2451,9 +2469,11 @@ export function registerIpcHandlers(): void {
         try {
           const response = await fetch('https://api.tavily.com/search', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${credentials.apiKey}`,
+            },
             body: JSON.stringify({
-              api_key: credentials.apiKey,
               query: 'test connection',
               search_depth: 'basic',
               max_results: 1,
@@ -2940,10 +2960,8 @@ export function registerIpcHandlers(): void {
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<{ resolvedPath: string; content: string } | null> => {
       const { resolveAndReadFile, resolveFilePath } = await import('./lib/file-preview-service')
       const options = normalizeFileAccessOptions(access)
-      const allowedBasePaths = getAllowedCandidateBasePaths(options)
-      const resolved = resolveFilePath(filePath, allowedBasePaths)
-      if (!resolved || !isPathAllowed(resolved, options)) {
-        console.warn('[IPC] file:resolve-and-read 拒绝越界路径:', resolved ?? filePath)
+      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
+      if (!resolved) {
         return null
       }
       const result = resolveAndReadFile(resolved)
@@ -2976,11 +2994,7 @@ export function registerIpcHandlers(): void {
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<ResolvedFileUrl | null> => {
       const { resolveFilePath } = await import('./lib/file-preview-service')
       const options = normalizeFileAccessOptions(access)
-      const result = resolveFilePath(filePath, getAllowedCandidateBasePaths(options))
-      if (result && !isPathAllowed(result, options)) {
-        console.warn('[IPC] file:resolve-path 拒绝越界路径:', result)
-        return null
-      }
+      const result = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
       if (!result) return null
       // registerPromaFilePath 对目录路径会抛「不是文件」。渲染端（如悬浮预览解析 markdown
       // 链接）可能传入目录路径，此处优雅降级为 null，而不是让异常冒泡成未捕获的 handler 错误。
@@ -2999,10 +3013,8 @@ export function registerIpcHandlers(): void {
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<{ tmpHtmlUrl: string } | null> => {
       const { preparePdfPreview, resolveFilePath } = await import('./lib/file-preview-service')
       const options = normalizeFileAccessOptions(access)
-      const allowedBasePaths = getAllowedCandidateBasePaths(options)
-      const resolved = resolveFilePath(filePath, allowedBasePaths)
-      if (!resolved || !isPathAllowed(resolved, options)) {
-        console.warn('[IPC] file:prepare-pdf-preview 拒绝越界路径:', resolved ?? filePath)
+      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
+      if (!resolved) {
         return null
       }
       const result = await preparePdfPreview(resolved)
@@ -3016,10 +3028,8 @@ export function registerIpcHandlers(): void {
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<{ resolvedPath: string; html: string } | null> => {
       const { convertDocxToHtml, resolveFilePath } = await import('./lib/file-preview-service')
       const options = normalizeFileAccessOptions(access)
-      const allowedBasePaths = getAllowedCandidateBasePaths(options)
-      const resolved = resolveFilePath(filePath, allowedBasePaths)
-      if (!resolved || !isPathAllowed(resolved, options)) {
-        console.warn('[IPC] file:docx-to-html 拒绝越界路径:', resolved ?? filePath)
+      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
+      if (!resolved) {
         return null
       }
       const result = await convertDocxToHtml(resolved)
@@ -3033,25 +3043,23 @@ export function registerIpcHandlers(): void {
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<import('@proma/shared').OfficePreviewResult | null> => {
       const { convertOfficeToHtml, resolveFilePath } = await import('./lib/file-preview-service')
       const options = normalizeFileAccessOptions(access)
-      const allowedBasePaths = getAllowedCandidateBasePaths(options)
-      const resolved = resolveFilePath(filePath, allowedBasePaths)
-      if (!resolved || !isPathAllowed(resolved, options)) {
-        console.warn('[IPC] file:office-to-html 拒绝越界路径:', resolved ?? filePath)
+      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
+      if (!resolved) {
         return null
       }
       return convertOfficeToHtml(resolved)
     }
   )
 
-  // 读取文件为 base64（带路径校验，供内联图片预览等使用）
+  // 读取文件为 base64（供内联图片预览等使用）
   ipcMain.handle(
     'file:read-binary-base64',
     async (_, filePath: string, access?: FileAccessOptions | string[], maxSize?: number): Promise<string | null> => {
       const { readFileSync, statSync } = await import('node:fs')
       const { resolveFilePath } = await import('./lib/file-preview-service')
       const options = normalizeFileAccessOptions(access)
-      const resolved = resolveFilePath(filePath, getAllowedCandidateBasePaths(options))
-      if (!resolved || !isPathAllowed(resolved, options)) return null
+      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
+      if (!resolved) return null
       const st = statSync(resolved)
       if (maxSize && st.size > maxSize) return null
       return readFileSync(resolved).toString('base64')
@@ -3688,7 +3696,7 @@ export function registerIpcHandlers(): void {
     }
   )
 
-  // 获取活跃绑定列表
+  // 获取绑定列表（包含已归档，前端按视图过滤）
   ipcMain.handle(
     FEISHU_IPC_CHANNELS.LIST_BINDINGS,
     async (): Promise<FeishuChatBinding[]> => {
@@ -4414,8 +4422,8 @@ export function registerIpcHandlers(): void {
   const isFiniteInt = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v)
   const validScheduleType = (v: unknown): v is 'interval' | 'daily' | 'weekly' | 'monthly' =>
     v === 'interval' || v === 'daily' || v === 'weekly' || v === 'monthly'
-  const validPermissionMode = (v: unknown): v is 'auto' | 'bypassPermissions' =>
-    v === 'auto' || v === 'bypassPermissions'
+  const validPermissionMode = (v: unknown): v is 'bypassPermissions' =>
+    v === 'bypassPermissions'
   const validAutomationNotificationTrigger = (v: unknown): v is 'always' | 'success' | 'error' =>
     v === 'always' || v === 'success' || v === 'error'
   const validTimeOfDay = (v: unknown): boolean => typeof v === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(v)

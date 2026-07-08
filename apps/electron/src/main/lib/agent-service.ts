@@ -164,6 +164,7 @@ export async function runAgent(
             stoppedByUser: opts?.stoppedByUser ?? false,
             startedAt: opts?.startedAt,
             resultSubtype: opts?.resultSubtype,
+            resultErrors: opts?.resultErrors,
             backgroundTasksPending: opts?.backgroundTasksPending,
           })
         }
@@ -249,6 +250,7 @@ export async function runAgentHeadless(
             stoppedByUser: opts?.stoppedByUser ?? false,
             startedAt: opts?.startedAt,
             resultSubtype: opts?.resultSubtype,
+            resultErrors: opts?.resultErrors,
             backgroundTasksPending: opts?.backgroundTasksPending,
           })
         }
@@ -371,9 +373,13 @@ export async function queueAgentMessage(
   return orchestrator.queueMessage(
     input.sessionId,
     input.userMessage,
+    input.rawUserMessage,
     undefined,
     input.uuid,
     { interrupt: input.interrupt },
+    input.mentionedSkills,
+    input.mentionedMcpServers,
+    input.mentionedSessionIds,
   )
 }
 

@@ -37,7 +37,9 @@ import { groupIntoTurns, MessageGroupRenderer, getGroupId, getGroupPreview, extr
 import { buildLiveGroupSet } from './live-group-set'
 import { ContentBlock } from './ContentBlock'
 import { parseThinkTagsFromText } from './thinking-tag-parser'
-import type { AgentEventUsage, RetryAttempt, SDKMessage } from '@proma/shared'
+import { AgentHistorySelectionLayer } from './AgentHistorySelectionLayer'
+import type { AgentEventUsage, RetryAttempt, SDKMessage, SDKSystemMessage } from '@proma/shared'
+import { getSDKCompactStatus } from '@proma/shared'
 import type { AgentStreamState } from '@/atoms/agent-atoms'
 
 function stableStringify(value: unknown): string {
@@ -84,6 +86,13 @@ function getSDKMessageStableKey(message: SDKMessage): string {
 
   stableKeyCache.set(message, key)
   return key
+}
+
+function hasCompactStatus(messages: SDKMessage[]): boolean {
+  return messages.some((message) => {
+    if (message.type !== 'system') return false
+    return getSDKCompactStatus(message as SDKSystemMessage) != null
+  })
 }
 
 /** AgentMessages 属性接口 */
@@ -402,6 +411,7 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
   const userProfile = useAtomValue(userProfileAtom)
   const setMinimapCache = useSetAtom(tabMinimapCacheAtom)
   const channels = useAtomValue(channelsAtom)
+  const historySelectionRootRef = React.useRef<HTMLDivElement>(null)
   /** 淡入控制：切换会话时先隐藏，等布局完成后再显示。 */
   const [ready, setReady] = React.useState(false)
   // 空会话无需淡入过渡（无消息则无滚动位置问题）
@@ -553,6 +563,9 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
   // compactInFlight 从点击压缩 / SDK compacting 事件开始为 true，
   // 直到整个 stream 结束（stream state 被删除）才消失。
   const suppressAgentRunning = streamState?.isCompacting || streamState?.compactInFlight
+  const compactStatusInLiveMessages = React.useMemo(() => {
+    return hasCompactStatus(liveMessages ?? [])
+  }, [liveMessages])
 
   // 统一分组：将持久化 + 实时消息合并后再分组，确保 system 消息（如压缩分割线）出现在正确位置
   // 编辑模式下使用 displayMessages（隐藏编辑点后的消息）
@@ -628,102 +641,105 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
 
   return (
     <BasePathsProvider basePaths={attachedDirs}>
-    <Conversation resize={ready && !transitioning ? 'smooth' : 'instant'} className={ready ? (skipFadeIn ? 'opacity-100' : 'opacity-100 transition-opacity duration-200') : 'opacity-0'}>
-      <ScrollPositionManager id={sessionId} ready={ready} />
-      <ConversationContent>
-        {!hasContent && !streaming ? (
-          <EmptyState />
-        ) : (
-          <>
-            {/* 统一消息渲染（持久化 + 实时合并为一个列表，确保 system 消息位置正确） */}
-            {allGroups.map((group, idx) => {
-              const isLive = liveGroupSet.has(group)
-              const isErrorGroup = group.type === 'assistant-turn'
-                && group.assistantMessages.some((m) => !!m.error)
-              const shouldDisableActions = isLive && !isErrorGroup
-              // 仅在最后一个 assistant-turn 上显示"已被用户中断" badge
-              const isLastAssistantTurn = !streaming && stoppedByUser
-                && group.type === 'assistant-turn'
-                && idx === allGroups.findLastIndex((g) => g.type === 'assistant-turn')
-              return (
-                <MessageGroupRenderer
-                  key={getGroupId(group)}
-                  group={group}
-                  allMessages={allSDKMessages}
-                  historicalTaskSubjects={historicalTaskSubjects}
-                  basePath={sessionPath || undefined}
-                  onFork={shouldDisableActions ? undefined : onFork}
-                  onRewind={shouldDisableActions ? undefined : onRewind}
-                  onRetry={shouldDisableActions ? undefined : onRetry}
-                  onRetryInNewSession={shouldDisableActions ? undefined : onRetryInNewSession}
-                  onCompact={shouldDisableActions ? undefined : onCompact}
-                  onEdit={shouldDisableActions ? undefined : onEdit}
-                  isStreaming={isLive || undefined}
-                  stoppedByUser={isLastAssistantTurn || undefined}
-                  sessionModelId={sessionModelId}
-                />
-              )
-            })}
+    <div ref={historySelectionRootRef} className="relative flex min-h-0 flex-1 flex-col">
+      <Conversation resize={ready && !transitioning ? 'smooth' : 'instant'} className={ready ? (skipFadeIn ? 'opacity-100' : 'opacity-100 transition-opacity duration-200') : 'opacity-0'}>
+        <ScrollPositionManager id={sessionId} ready={ready} />
+        <ConversationContent>
+          {!hasContent && !streaming ? (
+            <EmptyState />
+          ) : (
+            <>
+              {/* 统一消息渲染（持久化 + 实时合并为一个列表，确保 system 消息位置正确） */}
+              {allGroups.map((group, idx) => {
+                const isLive = liveGroupSet.has(group)
+                const isErrorGroup = group.type === 'assistant-turn'
+                  && group.assistantMessages.some((m) => !!m.error)
+                const shouldDisableActions = isLive && !isErrorGroup
+                // 仅在最后一个 assistant-turn 上显示"已被用户中断" badge
+                const isLastAssistantTurn = !streaming && stoppedByUser
+                  && group.type === 'assistant-turn'
+                  && idx === allGroups.findLastIndex((g) => g.type === 'assistant-turn')
+                return (
+                  <MessageGroupRenderer
+                    key={getGroupId(group)}
+                    group={group}
+                    allMessages={allSDKMessages}
+                    historicalTaskSubjects={historicalTaskSubjects}
+                    basePath={sessionPath || undefined}
+                    onFork={shouldDisableActions ? undefined : onFork}
+                    onRewind={shouldDisableActions ? undefined : onRewind}
+                    onRetry={shouldDisableActions ? undefined : onRetry}
+                    onRetryInNewSession={shouldDisableActions ? undefined : onRetryInNewSession}
+                    onCompact={shouldDisableActions ? undefined : onCompact}
+                    onEdit={shouldDisableActions ? undefined : onEdit}
+                    isStreaming={isLive || undefined}
+                    stoppedByUser={isLastAssistantTurn || undefined}
+                    sessionModelId={sessionModelId}
+                  />
+                )
+              })}
 
-            {/* 有实时助手内容时：显示运行指示器或占位（防止 streaming 结束到 Actions Bar 出现之间的高度跳动） */}
-            {/* 不使用 mt：ConversationContent 的 gap-1(4px) 已提供间距，
-                匹配内部 MessageActions 的 gap-0.5(2px)+mt-0.5(2px)=4px 间距 */}
-            {hasLiveAssistantContent && !suppressAgentRunning && (
-              <div className="pl-[56px] min-h-[28px]">
-                {retrying && <RetryingNotice retrying={retrying} />}
-                {streaming && <AgentRunningIndicator startedAt={startedAt} />}
-              </div>
-            )}
-
-            {/* 无实时助手内容时：显示完整气泡（含头像/名称/时间） */}
-            {/* 注意：工具活动已通过 SDK 渲染路径（liveGroups）展示 */}
-            {!hasLiveAssistantContent && !suppressAgentRunning && (streaming || smoothContent || retrying) && (
-              <Message from="assistant">
-                <MessageHeader
-                  model={agentStreamingModel}
-                  time={formatMessageTime(Date.now())}
-                  logo={<AssistantLogo model={streamingModelId} />}
-                />
-                <MessageContent>
+              {/* 有实时助手内容时：显示运行指示器或占位（防止 streaming 结束到 Actions Bar 出现之间的高度跳动） */}
+              {/* 不使用 mt：ConversationContent 的 gap-1(4px) 已提供间距，
+                  匹配内部 MessageActions 的 gap-0.5(2px)+mt-0.5(2px)=4px 间距 */}
+              {hasLiveAssistantContent && !suppressAgentRunning && (
+                <div className="pl-[56px] min-h-[28px]">
                   {retrying && <RetryingNotice retrying={retrying} />}
-                  {smoothContent ? (
-                    <>
-                      <div className={cn('space-y-2')}>
-                        {smoothContentBlocks.map((block, index) => (
-                          <ContentBlock
-                            key={index}
-                            block={block}
-                            allMessages={allSDKMessages}
-                            basePath={sessionPath || undefined}
-                            basePaths={attachedDirs}
-                            index={index}
-                            dimmed={hasSmoothTextContent && block.type !== 'text'}
-                            isStreaming={streaming}
-                          />
-                        ))}
-                      </div>
-                      {streaming && <AgentRunningIndicator startedAt={startedAt} />}
-                    </>
-                  ) : (
-                    streaming && <AgentRunningIndicator startedAt={startedAt} />
-                  )}
-                </MessageContent>
-              </Message>
-            )}
+                  {streaming && <AgentRunningIndicator startedAt={startedAt} />}
+                </div>
+              )}
 
-            {/* 压缩中指示器：由 isCompacting flag 驱动的尾部元素，compact_boundary 到达时 flag 翻 false 自然消失，
-                视觉上被流中新出现的"上下文已压缩"分隔符无缝替换 */}
-            {streamState?.isCompacting && <CompactingIndicator />}
+              {/* 无实时助手内容时：显示完整气泡（含头像/名称/时间） */}
+              {/* 注意：工具活动已通过 SDK 渲染路径（liveGroups）展示 */}
+              {!hasLiveAssistantContent && !suppressAgentRunning && (streaming || smoothContent || retrying) && (
+                <Message from="assistant">
+                  <MessageHeader
+                    model={agentStreamingModel}
+                    time={formatMessageTime(Date.now())}
+                    logo={<AssistantLogo model={streamingModelId} />}
+                  />
+                  <MessageContent>
+                    {retrying && <RetryingNotice retrying={retrying} />}
+                    {smoothContent ? (
+                      <>
+                        <div className={cn('space-y-2')}>
+                          {smoothContentBlocks.map((block, index) => (
+                            <ContentBlock
+                              key={index}
+                              block={block}
+                              allMessages={allSDKMessages}
+                              basePath={sessionPath || undefined}
+                              basePaths={attachedDirs}
+                              index={index}
+                              dimmed={hasSmoothTextContent && block.type !== 'text'}
+                              isStreaming={streaming}
+                            />
+                          ))}
+                        </div>
+                        {streaming && <AgentRunningIndicator startedAt={startedAt} />}
+                      </>
+                    ) : (
+                      streaming && <AgentRunningIndicator startedAt={startedAt} />
+                    )}
+                  </MessageContent>
+                </Message>
+              )}
 
-          </>
+              {/* 压缩中指示器：由 isCompacting flag 驱动的尾部元素，compact_boundary 到达时 flag 翻 false 自然消失，
+                  视觉上被流中新出现的"上下文已压缩"分隔符无缝替换 */}
+              {streamState?.isCompacting && !compactStatusInLiveMessages && <CompactingIndicator />}
+
+            </>
+          )}
+        </ConversationContent>
+        <ScrollMinimap items={minimapItems} />
+        <ConversationScrollButton />
+        {allUserMessagesData.length > 0 && (
+          <StickyUserMessage userMessages={allUserMessagesData} />
         )}
-      </ConversationContent>
-      <ScrollMinimap items={minimapItems} />
-      <ConversationScrollButton />
-      {allUserMessagesData.length > 0 && (
-        <StickyUserMessage userMessages={allUserMessagesData} />
-      )}
-    </Conversation>
+      </Conversation>
+      <AgentHistorySelectionLayer sessionId={sessionId} rootRef={historySelectionRootRef} />
+    </div>
     </BasePathsProvider>
   )
 }

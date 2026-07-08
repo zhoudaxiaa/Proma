@@ -73,7 +73,7 @@ type ZodModule = typeof import('zod')
 
 const MAX_WAIT_SECONDS = 2 * 60 * 60
 const DEFAULT_WAIT_SECONDS = 30 * 60
-const RESULT_SUMMARY_CHAR_LIMIT = 12_000
+const RESULT_SUMMARY_CHAR_LIMIT = 50_000
 const DELEGATION_GOAL_CHAR_LIMIT = 1_000
 /** live Map 中保留的已结束委派上限，超出时按完成时间清理最老的（持久化仍可回查） */
 const MAX_RETAINED_FINISHED_DELEGATIONS = 200
@@ -643,6 +643,7 @@ function startDelegation(
     parentSessionId: ctx.sessionId,
     rootSessionId,
     sourceDelegationId: delegationId,
+    sourceAutomationId: parent?.sourceAutomationId,
     delegationRole: role,
     delegationStatus: 'running',
     delegationDepth: (parent?.delegationDepth ?? 0) + 1,
@@ -713,7 +714,7 @@ function startDelegation(
 function buildCollaborationSchemas(z: ZodModule['z']) {
   const nonBlankString = z.string().trim().min(1)
   const role = z.enum(['explore', 'research', 'implement', 'review', 'custom'])
-  const permissionMode = z.enum(['plan', 'auto', 'bypassPermissions'])
+  const permissionMode = z.enum(['plan', 'bypassPermissions'])
   const delegateItem = z.object({
     title: z.string().optional().describe('子会话标题，简短说明子任务'),
     role: role.optional().describe('子任务角色：explore/research/implement/review/custom'),

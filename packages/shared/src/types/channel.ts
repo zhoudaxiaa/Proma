@@ -18,6 +18,7 @@ export type ProviderType =
   | 'kimi-coding'
   | 'zhipu'
   | 'zhipu-coding'
+  | 'ark-coding-plan'
   | 'minimax'
   | 'doubao'
   | 'qwen'
@@ -39,6 +40,7 @@ export const PROVIDER_DEFAULT_URLS: Record<ProviderType, string> = {
   'kimi-coding': 'https://api.kimi.com/coding/v1',
   zhipu: 'https://open.bigmodel.cn/api/paas/v4',
   'zhipu-coding': 'https://open.bigmodel.cn/api/anthropic',
+  'ark-coding-plan': 'https://ark.cn-beijing.volces.com/api/plan',
   minimax: 'https://api.minimaxi.com/anthropic',
   doubao: 'https://ark.cn-beijing.volces.com/api/v3',
   qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
@@ -61,6 +63,7 @@ export const PROVIDER_LABELS: Record<ProviderType, string> = {
   'kimi-coding': 'Kimi Coding Plan',
   zhipu: '智谱 AI',
   'zhipu-coding': '智谱 Coding Plan',
+  'ark-coding-plan': '火山方舟 Coding Plan',
   minimax: 'MiniMax (API&编程包)',
   doubao: '豆包',
   qwen: '通义千问',
@@ -83,6 +86,7 @@ export const AGENT_COMPATIBLE_PROVIDERS: ReadonlySet<ProviderType> = new Set<Pro
   'kimi-api',
   'kimi-coding',
   'zhipu-coding',
+  'ark-coding-plan',
   'minimax',
   'openai',
   'xiaomi',
@@ -178,13 +182,37 @@ export interface ChannelsConfig {
 }
 
 /**
+ * 连接测试失败的归一化分类
+ *
+ * 以 HTTP 状态码为主轴判定；UI 可据此渲染不同提示 / 图标，
+ * 而无需解析 message 字符串。
+ */
+export type ChannelTestErrorType =
+  | 'auth'
+  | 'permission'
+  | 'not_found'
+  | 'rate_limit'
+  | 'quota'
+  | 'bad_request'
+  | 'server'
+  | 'network'
+  | 'timeout'
+  | 'unknown'
+
+/**
  * 连接测试结果
  */
 export interface ChannelTestResult {
   /** 是否成功 */
   success: boolean
-  /** 结果消息 */
+  /** 结果消息（含分类提示与脱敏后的供应商摘要） */
   message: string
+  /** 归一化错误分类，成功时为空 */
+  errorType?: ChannelTestErrorType
+  /** HTTP 状态码，网络 / 超时等无响应异常时为空 */
+  statusCode?: number
+  /** 供应商原始错误摘要，已脱敏并截断 */
+  detail?: string
 }
 
 /**

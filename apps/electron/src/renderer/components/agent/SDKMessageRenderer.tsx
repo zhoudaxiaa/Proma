@@ -12,7 +12,7 @@
  */
 
 import * as React from 'react'
-import { Bot, Loader2, AlertTriangle, FileText, FileImage, Download, Split, Undo2, RotateCw, Plus, Minimize2, Wrench, Settings, ExternalLink, Quote, Clock, Pencil } from 'lucide-react'
+import { Bot, Loader2, AlertTriangle, FileText, FileImage, Download, Split, Undo2, RotateCw, Plus, Minimize2, Wrench, Settings, ExternalLink, Quote, Clock, Pencil, Cpu } from 'lucide-react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { cn } from '@/lib/utils'
 import { ImageLightbox } from '@/components/ui/image-lightbox'
@@ -22,6 +22,20 @@ import { TurnFileChangesSummary } from './TurnFileChangesSummary'
 import { ProcessBlockGroup, buildAssistantTurnRenderItems, buildCompletedToolResultIds } from './ProcessBlockGroup'
 import { extractToolResultText, parseTaskCreateResult, TASK_TOOL_NAMES } from './task-progress'
 import { normalizeThinkTagsInContentBlocks } from './thinking-tag-parser'
+// 会话转录的纯逻辑(Turn 分组 / 快照去重 / 预览)已下沉到 @proma/session-core 作为唯一真源。
+// 这里 import 供本文件内部使用，并 re-export 以保持既有 `from './SDKMessageRenderer'` 导入方零改动。
+import {
+  groupIntoTurns,
+  getGroupPreview,
+  extractUserText,
+  extractMeta,
+  isUserInputMessage,
+  stripScheduledRunMarker,
+  type MessageGroup,
+  type AssistantTurn,
+} from '@proma/session-core'
+export { groupIntoTurns, getGroupPreview, extractUserText } from '@proma/session-core'
+export type { MessageGroup, AssistantTurn } from '@proma/session-core'
 import { DurationBadge } from './AgentMessages'
 import {
   Message,
@@ -39,7 +53,7 @@ import { Badge } from '@/components/ui/badge'
 import { formatMessageTime } from '@/components/chat/ChatMessageItem'
 import { getModelLogo, resolveModelDisplayName, resolveModelProvider } from '@/lib/model-logo'
 import { userProfileAtom } from '@/atoms/user-profile'
-import { channelsAtom } from '@/atoms/chat-atoms'
+import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
 import { agentProcessGroupsKeepExpandedAtom, agentSessionPendingFilesAtom } from '@/atoms/agent-atoms'
 import { agentSessionsAtom } from '@/atoms/agent-atoms'
 import { activeSessionIdAtom } from '@/atoms/tab-atoms'
@@ -49,6 +63,8 @@ import { environmentCheckDialogOpenAtom } from '@/atoms/environment'
 import { settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
 import { useOpenPreview } from '@/components/diff/preview-opener'
 import { getFileParentPath } from '@/lib/file-utils'
+import { parseQuotedSelectionRefs } from '@/lib/quoted-selection'
+import type { ParsedQuotedSelectionRef } from '@/lib/quoted-selection'
 import type {
   SDKMessage,
   SDKAssistantMessage,
@@ -63,6 +79,7 @@ import type {
 } from '@proma/shared'
 import type { AgentPendingFile } from '@proma/shared'
 import {
+  getSDKCompactStatus,
   THINKING_SIGNATURE_ERROR_CODE,
   THINKING_SIGNATURE_ERROR_TITLE,
   THINKING_SIGNATURE_ERROR_MESSAGE,
@@ -118,7 +135,7 @@ function PermissionDeniedNotice({ message }: { message: SDKSystemMessage }): Rea
         <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
         <div className="min-w-0 space-y-1">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="font-medium text-foreground">自动审批已拒绝操作</span>
+            <span className="font-medium text-foreground">权限检查已拒绝操作</span>
             {toolName && (
               <span className="rounded bg-background/60 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
                 {toolName}
@@ -152,18 +169,39 @@ export function CompactingIndicator(): React.ReactElement {
   )
 }
 
-// ===== 辅助：从 SDKMessage 提取元数据 =====
-
-interface MessageMeta {
-  createdAt?: number
-}
-
-function extractMeta(message: SDKMessage): MessageMeta {
-  const msg = message as Record<string, unknown>
-  return {
-    createdAt: typeof msg._createdAt === 'number' ? msg._createdAt : undefined,
+function CompactStatusNotice({ message, active = false }: { message: SDKSystemMessage; active?: boolean }): React.ReactElement | null {
+  const compactStatus = getSDKCompactStatus(message)
+  if (compactStatus === 'success') return <CompactBoundaryDivider />
+  if (compactStatus === 'compacting') {
+    if (active) return <CompactingIndicator />
+    return (
+      <div className="flex items-center gap-3 my-4 px-1">
+        <div className="flex-1 h-px bg-border/40" />
+        <span className="shrink-0 text-[11px] text-muted-foreground/60 px-2 py-0.5 rounded-full border border-border/30 bg-muted/20">
+          开始压缩上下文
+        </span>
+        <div className="flex-1 h-px bg-border/40" />
+      </div>
+    )
   }
+  if (compactStatus === 'failed') {
+    const error = typeof message.compact_error === 'string' ? message.compact_error : undefined
+    return (
+      <div className="my-3 pl-[46px] pr-1">
+        <div className="flex items-start gap-2.5 rounded-md border border-destructive/25 bg-destructive/5 px-3 py-2.5 text-xs text-foreground/80">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
+          <div className="min-w-0 space-y-1">
+            <div className="font-medium text-foreground">上下文压缩失败</div>
+            {error && <p className="break-words text-muted-foreground">{error}</p>}
+          </div>
+        </div>
+      </div>
+    )
+  }
+  return null
 }
+
+// extractMeta / MessageMeta 已迁移至 @proma/session-core
 
 /** 从 turn 消息列表中提取 result 消息的耗时和用量数据 */
 function extractTurnUsage(turnMessages: SDKMessage[]): { durationMs?: number; usage?: AgentEventUsage } {
@@ -174,9 +212,15 @@ function extractTurnUsage(turnMessages: SDKMessage[]): { durationMs?: number; us
     const durationMs = typeof raw._durationMs === 'number' ? raw._durationMs : undefined
     const u = resultMsg.usage
     if (!u) return { durationMs }
-    const contextWindow = resultMsg.modelUsage
-      ? Object.values(resultMsg.modelUsage)[0]?.contextWindow
-      : undefined
+    // 多 entry 场景（Task 子 Agent 等）：取最大 contextWindow
+    let contextWindow: number | undefined
+    if (resultMsg.modelUsage) {
+      for (const info of Object.values(resultMsg.modelUsage)) {
+        if (info?.contextWindow && (contextWindow === undefined || info.contextWindow > contextWindow)) {
+          contextWindow = info.contextWindow
+        }
+      }
+    }
     return {
       durationMs,
       usage: {
@@ -192,21 +236,7 @@ function extractTurnUsage(turnMessages: SDKMessage[]): { durationMs?: number; us
   return {}
 }
 
-// ===== 辅助：从 user 消息中提取纯文本内容 =====
-
-export function extractUserText(message: SDKUserMessage): string | null {
-  const content = message.message?.content
-  if (!Array.isArray(content)) return null
-
-  const texts: string[] = []
-  for (const block of content) {
-    if (block.type === 'text' && 'text' in block) {
-      texts.push((block as { text: string }).text)
-    }
-  }
-
-  return texts.length > 0 ? texts.join('\n') : null
-}
+// extractUserText 已迁移至 @proma/session-core
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -227,17 +257,7 @@ function extractToolResultForTask(message: SDKUserMessage, resultBlock: SDKToolR
   return extractStructuredToolResultText(message) ?? extractToolResultText(resultBlock.content)
 }
 
-// ===== 辅助：判断 user 消息是否为真正的人类用户输入（非工具结果/子代理提示） =====
-
-function isUserInputMessage(message: SDKUserMessage): boolean {
-  if (message.parent_tool_use_id) return false
-  // SDK 合成消息（如 Skill 展开 prompt）不是用户输入
-  if (message.isSynthetic) return false
-  // 包含 tool_result 块的消息是工具结果，不是用户输入
-  const content = message.message?.content
-  if (Array.isArray(content) && content.some((b) => b.type === 'tool_result')) return false
-  return extractUserText(message) !== null
-}
+// isUserInputMessage 已迁移至 @proma/session-core
 
 // ===== 助手头像 =====
 
@@ -259,176 +279,9 @@ function AssistantLogo({ model }: { model?: string }): React.ReactElement {
   )
 }
 
-// ===== Turn 分组类型 =====
+// AssistantTurn / MessageGroup 类型已迁移至 @proma/session-core
 
-export interface AssistantTurn {
-  type: 'assistant-turn'
-  /** 当前 turn 内所有 assistant 消息 */
-  assistantMessages: SDKAssistantMessage[]
-  /** 当前 turn 内所有消息（含 tool_result user 消息，供工具结果查找） */
-  turnMessages: SDKMessage[]
-  /** 模型名称（取首条 assistant 消息的 model） */
-  model?: string
-  /** 创建时间（取首条 assistant 消息的时间） */
-  createdAt?: number
-  /**
-   * 该 turn 由后台任务完成通知（task_notification）唤醒后开始。
-   * 用于阻断与前一 turn 的合并，让自动唤醒的新输出独立成块，而不是被追加进上一轮的消息块。
-   */
-  startsAfterWake?: boolean
-}
-
-export type MessageGroup =
-  | { type: 'user'; message: SDKUserMessage }
-  | { type: 'system'; message: SDKSystemMessage }
-  | AssistantTurn
-
-/**
- * 将 SDKMessage 列表分组为可渲染的 Turn
- *
- * 规则：
- * 1. user（真正用户输入）→ 单独的 user group
- * 2. assistant + user(tool_result) + assistant... → 合并为一个 assistant-turn
- * 3. system（compact_boundary / compacting / permission_denied）→ 独立渲染，其他归入当前 turn
- * 4. 其他类型（result, tool_progress 等）→ 归入当前 assistant-turn
- * 5. 后处理：合并相邻同模型的 assistant-turn（处理子代理切换模型导致的碎片化）
- */
-export function groupIntoTurns(messages: SDKMessage[], sessionModelId?: string): MessageGroup[] {
-  const groups: MessageGroup[] = []
-  let currentTurn: AssistantTurn | null = null
-  // 收到后台任务完成通知（task_notification）后，若没有用户输入就直接出现新的 assistant 输出，
-  // 说明这是自动唤醒的新一轮，应另起独立消息块，而不是续接上一轮。
-  // 注意：不能用 result 做信号——正常对话每轮也以 result 结束，会误伤普通回复。
-  let pendingWakeBoundary = false
-
-  const flushTurn = (): void => {
-    if (currentTurn && currentTurn.assistantMessages.length > 0) {
-      groups.push(currentTurn)
-    }
-    currentTurn = null
-  }
-
-  for (const msg of messages) {
-    if (msg.type === 'user') {
-      const userMsg = msg as SDKUserMessage
-      if (isUserInputMessage(userMsg)) {
-        // 真正的用户输入 → 结束当前 turn，开始新段落
-        flushTurn()
-        groups.push({ type: 'user', message: userMsg })
-        pendingWakeBoundary = false
-      } else {
-        // tool_result 消息 → 归入当前 turn
-        if (currentTurn) {
-          currentTurn.turnMessages.push(msg)
-        }
-      }
-    } else if (msg.type === 'assistant') {
-      const aMsg = msg as SDKAssistantMessage
-      // 跳过重放消息
-      if (aMsg.isReplay) continue
-
-      if (!currentTurn) {
-        // 开始新 turn
-        const meta = extractMeta(msg)
-        currentTurn = {
-          type: 'assistant-turn',
-          assistantMessages: [aMsg],
-          turnMessages: [msg],
-          model: aMsg._channelModelId || aMsg.message?.model || sessionModelId,
-          createdAt: meta.createdAt,
-          // 紧跟在后台任务唤醒之后的新 turn：阻断与上一轮的合并
-          startsAfterWake: pendingWakeBoundary || undefined,
-        }
-        pendingWakeBoundary = false
-      } else {
-        // 继续当前 turn
-        currentTurn.assistantMessages.push(aMsg)
-        currentTurn.turnMessages.push(msg)
-      }
-    } else if (msg.type === 'system') {
-      const sysMsg = msg as SDKSystemMessage
-      // 仅需要独立渲染的 system 消息才中断 turn（compact_boundary / compacting / permission_denied）
-      // 其他 system 消息（如 init、task_started、task_progress）归入当前 turn，不中断分组
-      if (sysMsg.subtype === 'compact_boundary' || sysMsg.subtype === 'compacting' || sysMsg.subtype === 'permission_denied') {
-        flushTurn()
-        groups.push({ type: 'system', message: sysMsg })
-      } else if (sysMsg.subtype === 'task_notification') {
-        // 后台任务完成通知：仅在没有进行中的 turn 时标记唤醒边界（真正的唤醒场景）。
-        // 若当前有 turn 正在进行，归入当前 turn 不截断。
-        if (currentTurn) {
-          currentTurn.turnMessages.push(msg)
-        } else {
-          pendingWakeBoundary = true
-        }
-      } else if (currentTurn) {
-        currentTurn.turnMessages.push(msg)
-      }
-    } else {
-      // result, tool_progress 等 → 归入当前 turn
-      // prompt_suggestion 不属于对话转录，不入 turn，避免被当作文本附加到助手消息末尾
-      if ((msg as { type: string }).type === 'prompt_suggestion') {
-        continue
-      }
-      if (currentTurn) {
-        currentTurn.turnMessages.push(msg)
-      }
-    }
-  }
-
-  flushTurn()
-  return mergeAdjacentSameModelTurns(groups)
-}
-
-/**
- * 后处理：合并相邻同模型的 assistant-turn
- *
- * 当子代理（如 haiku）执行多个工具调用时，中间的 user(tool_result) 消息
- * 可能导致 turn 被拆分为多个碎片。此函数将同模型的相邻 assistant-turn 合并，
- * 同时吸收它们之间的非用户输入 group（如被误判为用户输入的子代理内部消息）。
- */
-function mergeAdjacentSameModelTurns(groups: MessageGroup[]): MessageGroup[] {
-  if (groups.length <= 1) return groups
-
-  const result: MessageGroup[] = []
-
-  for (const group of groups) {
-    if (group.type !== 'assistant-turn') {
-      result.push(group)
-      continue
-    }
-
-    // 后台任务唤醒后开始的 turn：独立成块，不向前合并。
-    if (group.startsAfterWake) {
-      result.push(group)
-      continue
-    }
-
-    // 向前查找可合并的同模型 assistant-turn（跳过非 user-input 的中间 group）
-    let mergeTargetIdx = -1
-    for (let i = result.length - 1; i >= 0; i--) {
-      const prev = result[i]!
-      if (prev.type === 'user') break // 真正的用户输入阻断合并
-      if (prev.type === 'system' && ['compact_boundary', 'permission_denied'].includes((prev.message as SDKSystemMessage).subtype ?? '')) break
-      if (prev.type === 'assistant-turn') {
-        if (prev.model === group.model) {
-          mergeTargetIdx = i
-        }
-        break // 遇到第一个 assistant-turn 就停止（不跨越不同模型的 turn）
-      }
-      // system 或其他 group：继续向前查找
-    }
-
-    if (mergeTargetIdx >= 0) {
-      const target = result[mergeTargetIdx] as AssistantTurn
-      target.assistantMessages.push(...group.assistantMessages)
-      target.turnMessages.push(...group.turnMessages)
-    } else {
-      result.push(group)
-    }
-  }
-
-  return result
-}
+// groupIntoTurns / mergeAdjacentSameModelTurns 已迁移至 @proma/session-core
 
 function buildTaskProgressData(
   topLevelBlocks: SDKContentBlock[],
@@ -849,15 +702,12 @@ export function SDKMessageRenderer({
   if (msgType === 'system') {
     const sysMsg = message as SDKSystemMessage
     const subtype = sysMsg.subtype
+    const compactStatus = getSDKCompactStatus(sysMsg)
 
-    if (subtype === 'compact_boundary') {
-      return <CompactBoundaryDivider />
-    }
+    if (compactStatus) return <CompactStatusNotice message={sysMsg} />
     if (subtype === 'permission_denied') {
       return <PermissionDeniedNotice message={sysMsg} />
     }
-
-    // compacting 事件已由 isCompacting flag 驱动的尾部指示器接管（见 AgentMessages），此处不再渲染持久条目
 
     return null
   }
@@ -874,36 +724,17 @@ export interface AttachedFileRef {
 }
 
 /** 解析的引用文件 */
-export interface QuotedFileRef {
-  /** 源文件路径 */
-  path: string
-  /** 源文件名 */
-  filename: string
-}
+export type QuotedFileRef = ParsedQuotedSelectionRef
 
-/** 解析消息中的 <attached_files> 块和 <quoted_file> 块，返回文件列表、引用列表和剩余文本 */
+/** 解析消息中的 <attached_files>、<quoted_file> 和 <quoted_context> 块，返回文件列表、引用列表和剩余文本 */
 export function parseAttachedFiles(content: string): { files: AttachedFileRef[]; quotes: QuotedFileRef[]; text: string } {
-  const quoteRegex = /<quoted_file[^>]*>[\s\S]*?<\/quoted_file>\n*/g
-  const quotes: QuotedFileRef[] = []
-  let quoteMatch: RegExpExecArray | null
-  while ((quoteMatch = quoteRegex.exec(content)) !== null) {
-    const pathMatch = quoteMatch[0].match(/path="([^"]*)"/)
-    if (pathMatch) {
-      // 反解 XML 实体：&amp; 必须最后做，否则会被先一步解出的 & 误伤
-      const filePath = pathMatch[1]!
-        .replace(/&quot;/g, '"')
-        .replace(/&gt;/g, '>')
-        .replace(/&lt;/g, '<')
-        .replace(/&amp;/g, '&')
-      quotes.push({ path: filePath, filename: filePath.split('/').pop() ?? filePath })
-    }
-  }
+  const parsedQuotes = parseQuotedSelectionRefs(content)
+  const quotes: QuotedFileRef[] = parsedQuotes.quotes
 
   const regex = /<attached_files>\n?([\s\S]*?)\n?<\/attached_files>\n*/
   const match = content.match(regex)
   if (!match) {
-    const cleanText = content.replace(/<quoted_file[^>]*>[\s\S]*?<\/quoted_file>\n*/g, '').trim()
-    return { files: [], quotes, text: cleanText }
+    return { files: [], quotes, text: parsedQuotes.text }
   }
 
   const files: AttachedFileRef[] = []
@@ -915,9 +746,7 @@ export function parseAttachedFiles(content: string): { files: AttachedFileRef[];
     }
   }
 
-  let text = content.replace(regex, '')
-  text = text.replace(/<quoted_file[^>]*>[\s\S]*?<\/quoted_file>\n*/g, '')
-  text = text.trim()
+  const text = parsedQuotes.text.replace(regex, '').trim()
   return { files, quotes, text }
 }
 
@@ -1018,10 +847,11 @@ function AttachedFileChip({ file }: { file: AttachedFileRef }): React.ReactEleme
 
 /** 引用文件 Chip（显示在用户消息中，表示该消息引用了某个文件的选中内容） */
 function QuoteChip({ quote }: { quote: QuotedFileRef }): React.ReactElement {
+  const label = quote.label ?? quote.filename
   return (
     <div className="inline-flex items-center gap-1.5 rounded-md bg-primary/8 border border-primary/20 px-2.5 py-1 text-[12px] text-muted-foreground">
       <Quote className="size-3.5 shrink-0 text-primary/60" />
-      <span className="truncate max-w-[200px]">{quote.filename}</span>
+      <span className="truncate max-w-[200px]">{label}</span>
     </div>
   )
 }
@@ -1031,9 +861,7 @@ function QuoteChip({ quote }: { quote: QuotedFileRef }): React.ReactElement {
 
 const SCHEDULED_RUN_MARKER = '<!--PROMA_SCHEDULED_RUN-->'
 
-function stripScheduledRunMarker(text: string): string {
-  return text.replaceAll(SCHEDULED_RUN_MARKER, '').trim()
-}
+// stripScheduledRunMarker 已迁移至 @proma/session-core（本文件从该包 import 使用）
 
 function ScheduledRunBadge(): React.ReactElement {
   const activeSessionId = useAtomValue(activeSessionIdAtom)
@@ -1043,7 +871,7 @@ function ScheduledRunBadge(): React.ReactElement {
   const setActiveView = useSetAtom(activeViewAtom)
 
   const session = sessions.find((s) => s.id === activeSessionId)
-  const automation = session?.sourceAutomationId
+  const automation = session?.sourceAutomationId && !session.sourceDelegationId
     ? automations.find((a) => a.id === session.sourceAutomationId)
     : undefined
 
@@ -1198,6 +1026,7 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
   const setEnvDialogOpen = useSetAtom(environmentCheckDialogOpenAtom)
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
   const setSettingsTab = useSetAtom(settingsTabAtom)
+  const setModelSelectorOpen = useSetAtom(modelSelectorOpenAtom)
   const [detailsOpen, setDetailsOpen] = React.useState(false)
 
   const contentText = message.message?.content
@@ -1227,6 +1056,9 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
       case 'settings':
         setSettingsOpen(true)
         break
+      case 'select_model':
+        setModelSelectorOpen(true)
+        break
       case 'open_external':
         if (action.payload) {
           window.electronAPI.openExternal(action.payload)
@@ -1253,6 +1085,8 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
       case 'open_channel_settings':
       case 'settings':
         return <Settings className="size-3.5 mr-1.5" />
+      case 'select_model':
+        return <Cpu className="size-3.5 mr-1.5" />
       case 'open_external':
         return <ExternalLink className="size-3.5 mr-1.5" />
       case 'retry':
@@ -1433,35 +1267,7 @@ export function getGroupId(group: MessageGroup): string {
   return `turn-empty-${++fallbackIdCounter}`
 }
 
-/**
- * 从 MessageGroup 中提取纯文本预览，供迷你地图使用
- */
-export function getGroupPreview(group: MessageGroup): string {
-  if (group.type === 'user') {
-    return stripScheduledRunMarker(extractUserText(group.message) ?? '')
-      .replace(/<attached_files>[\s\S]*?<\/attached_files>\n*/, '')
-      .replace(/<quoted_file[^>]*>[\s\S]*?<\/quoted_file>\n*/g, '')
-      .slice(0, 200)
-  }
-  if (group.type === 'system') {
-    if (group.message.subtype === 'compact_boundary') return '上下文已压缩'
-    if (group.message.subtype === 'compacting') return '正在压缩上下文...'
-    if (group.message.subtype === 'permission_denied') return '自动审批已拒绝操作'
-    return ''
-  }
-  // assistant-turn：收集所有 text 块
-  const texts: string[] = []
-  for (const aMsg of group.assistantMessages) {
-    const rawBlocks = aMsg.message?.content
-    if (!Array.isArray(rawBlocks)) continue
-    for (const block of normalizeThinkTagsInContentBlocks(rawBlocks)) {
-      if (block.type === 'text' && 'text' in block) {
-        texts.push((block as { text: string }).text)
-      }
-    }
-  }
-  return texts.join(' ').slice(0, 200)
-}
+// getGroupPreview 已迁移至 @proma/session-core（本文件从该包 import 并 re-export）
 
 export function MessageGroupRenderer({ group, allMessages, historicalTaskSubjects, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, onEdit, isStreaming, stoppedByUser, sessionModelId }: MessageGroupRendererProps): React.ReactElement | null {
   const groupId = getGroupId(group)
@@ -1476,8 +1282,7 @@ export function MessageGroupRenderer({ group, allMessages, historicalTaskSubject
 
   if (group.type === 'system') {
     const subtype = group.message.subtype
-    if (subtype === 'compact_boundary') return <div data-message-id={groupId}><CompactBoundaryDivider /></div>
-    if (subtype === 'compacting') return <div data-message-id={groupId}><CompactingIndicator /></div>
+    if (getSDKCompactStatus(group.message)) return <div data-message-id={groupId}><CompactStatusNotice message={group.message} active={isStreaming} /></div>
     if (subtype === 'permission_denied') return <div data-message-id={groupId}><PermissionDeniedNotice message={group.message} /></div>
     return null
   }

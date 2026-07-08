@@ -42,7 +42,7 @@ import type {
   FetchModelsResult,
   ProviderType,
 } from '@proma/shared'
-import { normalizeAnthropicProviderUrl } from '@proma/core'
+import { resolveAnthropicMessagesUrl, resolveOpenAIChatCompletionsUrl } from '@proma/core'
 import { getProviderLogo } from '@/lib/model-logo'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import {
@@ -72,7 +72,7 @@ interface ChannelFormProps {
 }
 
 /** 所有可选供应商 */
-const PROVIDER_OPTIONS: ProviderType[] = ['anthropic', 'anthropic-compatible', 'openai', 'deepseek', 'google', 'kimi-api', 'kimi-coding', 'zhipu', 'zhipu-coding', 'minimax', 'doubao', 'qwen', 'qwen-anthropic', 'xiaomi', 'xiaomi-token-plan', 'custom']
+const PROVIDER_OPTIONS: ProviderType[] = ['anthropic', 'anthropic-compatible', 'openai', 'deepseek', 'google', 'kimi-api', 'kimi-coding', 'zhipu', 'zhipu-coding', 'ark-coding-plan', 'minimax', 'doubao', 'qwen', 'qwen-anthropic', 'xiaomi', 'xiaomi-token-plan', 'custom']
 
 /** 供应商选项（用于 SettingsSelect） */
 const PROVIDER_SELECT_OPTIONS = PROVIDER_OPTIONS.map((p) => ({
@@ -80,26 +80,6 @@ const PROVIDER_SELECT_OPTIONS = PROVIDER_OPTIONS.map((p) => ({
   label: PROVIDER_LABELS[p],
   icon: getProviderLogo(p),
 }))
-
-/** 各供应商的 Chat 端点路径，用于 Base URL 预览 */
-const PROVIDER_CHAT_PATHS: Record<ProviderType, string> = {
-  anthropic: '/v1/messages',
-  'anthropic-compatible': '/v1/messages',
-  openai: '/chat/completions',
-  deepseek: '/messages',
-  google: '/v1beta/models/{model}:generateContent',
-  'kimi-api': '/messages',
-  'kimi-coding': '/messages',
-  zhipu: '/chat/completions',
-  'zhipu-coding': '/messages',
-  minimax: '/v1/messages',
-  doubao: '/chat/completions',
-  qwen: '/chat/completions',
-  'qwen-anthropic': '/v1/messages',
-  xiaomi: '/v1/messages',
-  'xiaomi-token-plan': '/v1/messages',
-  custom: '/chat/completions',
-}
 
 /** 走 Anthropic 协议的供应商集合（共用 /v1/messages 端点） */
 const ANTHROPIC_PROTOCOL_PROVIDERS: ReadonlySet<ProviderType> = new Set<ProviderType>([
@@ -109,6 +89,7 @@ const ANTHROPIC_PROTOCOL_PROVIDERS: ReadonlySet<ProviderType> = new Set<Provider
   'kimi-api',
   'kimi-coding',
   'zhipu-coding',
+  'ark-coding-plan',
   'minimax',
   'xiaomi',
   'xiaomi-token-plan',
@@ -118,15 +99,26 @@ const ANTHROPIC_PROTOCOL_PROVIDERS: ReadonlySet<ProviderType> = new Set<Provider
 /**
  * 生成 API 端点预览 URL
  *
- * Anthropic 协议供应商：复用 normalizeAnthropicProviderUrl 计算 base，再拼 /messages，
- * 与运行时 channel-manager / AnthropicAdapter 的规范化逻辑保持一致。
+ * 与运行时 channel-manager / ProviderAdapter 的端点解析逻辑保持一致。
  */
 function buildPreviewUrl(baseUrl: string, provider: ProviderType): string {
   if (ANTHROPIC_PROTOCOL_PROVIDERS.has(provider)) {
-    return `${normalizeAnthropicProviderUrl(baseUrl, provider)}/messages`
+    return resolveAnthropicMessagesUrl(baseUrl, provider)
   }
-  const trimmed = baseUrl.trim().replace(/\/+$/, '')
-  return `${trimmed}${PROVIDER_CHAT_PATHS[provider]}`
+  if (provider === 'google') {
+    return `${baseUrl.trim().replace(/\/+$/, '')}/v1beta/models/{model}:generateContent`
+  }
+  return resolveOpenAIChatCompletionsUrl(baseUrl, provider)
+}
+
+function getUrlInputLabel(provider: ProviderType): string {
+  return provider === 'custom' || provider === 'anthropic-compatible' ? '请求地址' : 'Base URL'
+}
+
+function getUrlInputPlaceholder(provider: ProviderType): string {
+  if (provider === 'custom') return 'https://api.example.com/v1/chat/completions'
+  if (provider === 'anthropic-compatible') return 'https://api.example.com/v1/messages'
+  return 'https://api.example.com'
 }
 
 /** auto-save 防抖延迟 */
@@ -285,6 +277,17 @@ export function ChannelForm({ channel, onSaved, onAgentEligibilityChange, onCanc
           { id: 'glm-5.2', name: 'GLM-5.2', enabled: true },
           { id: 'glm-5.1', name: 'GLM-5.1', enabled: false },
         ])
+      } else if (p === 'ark-coding-plan') {
+        setModels([
+          { id: 'doubao-seed-2.0-code', name: 'Doubao Seed 2.0 Code', enabled: true },
+          { id: 'doubao-seed-2.0-pro', name: 'Doubao Seed 2.0 Pro', enabled: true },
+          { id: 'doubao-seed-2.0-lite', name: 'Doubao Seed 2.0 Lite', enabled: true },
+          { id: 'glm-5.2', name: 'GLM-5.2', enabled: true },
+          { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', enabled: true },
+          { id: 'minimax-m3', name: 'MiniMax M3', enabled: true },
+          { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', enabled: true },
+          { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', enabled: true },
+        ])
       } else if (p === 'minimax') {
         setModels([
           { id: 'MiniMax-M3', name: 'MiniMax-M3', enabled: true },
@@ -351,13 +354,14 @@ export function ChannelForm({ channel, onSaved, onAgentEligibilityChange, onCanc
 
       setFetchResult(result)
 
-      // 用拉取结果作为权威清单替换：
+      // 用成功拉取的结果作为权威清单替换：
       // - source==='manual' 的模型一律保留（即便不在新结果里）
       // - 在新结果里也存在的旧模型保留 enabled 状态
       // - 新出现的模型默认未启用
       // - 既不在新结果里、也不是手动添加的旧模型一律丢弃（清除残留）
-      // 失败（result.success===false）时 result.models 为空，等价于清掉所有非手动模型
-      const fetchedModels = result.success ? result.models : []
+      // 拉取失败时保留现有列表，避免 auto-save 持久化空模型列表
+      if (!result.success) return
+      const fetchedModels = result.models
       const fetchedById = new Map(fetchedModels.map((m) => [m.id, m]))
       setModels((prev) => {
         const manualKept = prev.filter((m) => m.source === 'manual' && !fetchedById.has(m.id))
@@ -369,8 +373,6 @@ export function ChannelForm({ channel, onSaved, onAgentEligibilityChange, onCanc
       })
     } catch (error) {
       setFetchResult({ success: false, message: '拉取模型请求失败', models: [] })
-      // IPC 异常等同样按"拉取结果为空"处理：清掉所有非手动模型，保留手动添加的
-      setModels((prev) => prev.filter((m) => m.source === 'manual'))
     } finally {
       setFetchingModels(false)
     }
@@ -542,10 +544,10 @@ export function ChannelForm({ channel, onSaved, onAgentEligibilityChange, onCanc
             required
           />
           <SettingsInput
-            label="Base URL"
+            label={getUrlInputLabel(provider)}
             value={baseUrl}
             onChange={setBaseUrl}
-            placeholder="https://api.example.com"
+            placeholder={getUrlInputPlaceholder(provider)}
             description={baseUrl.trim() ? `预览：${buildPreviewUrl(baseUrl, provider)}` : undefined}
           />
           {/* API Key + 测试连接同行 */}
@@ -588,11 +590,13 @@ export function ChannelForm({ channel, onSaved, onAgentEligibilityChange, onCanc
             </div>
             {testResult && (
               <div className={cn(
-                'flex items-center gap-1.5 text-xs',
+                'flex items-start gap-1.5 text-xs',
                 testResult.success ? 'text-emerald-600' : 'text-destructive'
               )}>
-                {testResult.success ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
-                <span>{testResult.message}</span>
+                {testResult.success
+                  ? <CheckCircle2 size={12} className="mt-0.5 shrink-0" />
+                  : <XCircle size={12} className="mt-0.5 shrink-0" />}
+                <span className="min-w-0 break-all">{testResult.message}</span>
               </div>
             )}
           </div>

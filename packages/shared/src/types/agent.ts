@@ -4,32 +4,6 @@
  * 包含 Agent SDK 集成所需的事件类型、会话管理、消息持久化和 IPC 通道常量。
  */
 
-// ===== 记忆配置 =====
-
-/** 全局记忆配置（MemOS Cloud） */
-export interface MemoryConfig {
-  /** 是否启用记忆功能 */
-  enabled: boolean
-  /** MemOS Cloud API Key */
-  apiKey: string
-  /** 用户标识 */
-  userId: string
-  /** 自定义 API 地址（可选，默认 MemOS Cloud） */
-  baseUrl?: string
-}
-
-/**
- * 全局记忆配置 IPC 通道常量
- */
-export const MEMORY_IPC_CHANNELS = {
-  /** 获取全局记忆配置 */
-  GET_CONFIG: 'memory:get-config',
-  /** 保存全局记忆配置 */
-  SET_CONFIG: 'memory:set-config',
-  /** 测试记忆连接 */
-  TEST_CONNECTION: 'memory:test-connection',
-} as const
-
 // ===== Agent 工作区 =====
 
 /** Agent 工作区 */
@@ -127,14 +101,6 @@ export interface SDKSessionMessage {
   /** 时间戳 */
   timestamp?: string
 }
-
-/**
- * SDK Beta 特性标识
- *
- * 当前支持：
- * - context-1m-2025-08-07: 启用 1M token 上下文窗口（Claude Sonnet 4+ / Opus 4.6+、DeepSeek V4 系列）
- */
-export type SdkBeta = 'context-1m-2025-08-07'
 
 /**
  * JSON Schema 输出格式
@@ -266,6 +232,10 @@ export interface SDKSystemMessage {
   task_type?: string
   tool_use_id?: string
   status?: string
+  /** SDK status: 上下文压缩结果 */
+  compact_result?: 'success' | 'failed'
+  /** SDK status: 上下文压缩失败原因 */
+  compact_error?: string
   summary?: string
   output_file?: string
   last_tool_name?: string
@@ -394,6 +364,7 @@ export interface RecoveryAction {
     | 'compact'
     | 'open_environment_check'
     | 'open_channel_settings'
+    | 'select_model'
     | 'open_external'
     | (string & {})
   /** 操作附带的载荷，例如 open_external 的 URL */
@@ -757,8 +728,14 @@ export interface AgentGenerateTitleInput {
 
 // ===== MCP 服务器配置 =====
 
-/** MCP 传输类型 */
+/** MCP 传输类型；Proma 将 Streamable HTTP 规范化存储为 http */
 export type McpTransportType = 'stdio' | 'http' | 'sse'
+
+/** 外部配置中常见的 Streamable HTTP 别名 */
+export type McpTransportTypeAlias = 'streamableHttp' | 'streamable-http' | 'streamable_http'
+
+/** MCP 传输类型输入；保存和运行前会规范化为 McpTransportType */
+export type McpTransportTypeInput = McpTransportType | McpTransportTypeAlias
 
 /** MCP 服务器条目 */
 export interface McpServerEntry {
@@ -875,11 +852,43 @@ export interface SkillFileContent {
   size: number
 }
 
+/** 工作区记忆文件摘要 */
+export interface WorkspaceMemoryFileSummary {
+  /** 文件是否存在 */
+  exists: boolean
+  /** 绝对路径 */
+  path: string
+  /** 文件大小（字节） */
+  size: number
+  /** 最近修改时间戳 */
+  updatedAt?: number
+}
+
+/** 工作区记忆摘要 */
+export interface WorkspaceMemorySummary {
+  /** 工作区级 CLAUDE.md */
+  claudeMd: WorkspaceMemoryFileSummary
+  /** SDK auto memory 目录 */
+  autoMemory: {
+    /** 绝对目录路径 */
+    directory: string
+    /** MEMORY.md 是否存在 */
+    memoryMdExists: boolean
+    /** 文本文件数量 */
+    fileCount: number
+    /** 总大小（字节） */
+    totalSize: number
+    /** 最近修改时间戳 */
+    updatedAt?: number
+  }
+}
+
 /** 工作区能力摘要（MCP + Skill 计数） */
 export interface WorkspaceCapabilities {
   mcpServers: Array<{ name: string; enabled: boolean; type: McpTransportType }>
   builtinMcpServers: BuiltinMcpServerSummary[]
   skills: SkillMeta[]
+  memory: WorkspaceMemorySummary
 }
 
 // ===== Agent 发送输入 =====
@@ -926,6 +935,8 @@ export interface AgentQueueMessageInput {
   sessionId: string
   /** 用户消息内容 */
   userMessage: string
+  /** 仅用于持久化/重放的原始用户输入；省略时回退到 userMessage */
+  rawUserMessage?: string
   /** 前端预生成的 UUID（用于乐观更新去重） */
   uuid?: string
   /**
@@ -934,6 +945,12 @@ export interface AgentQueueMessageInput {
    * false / undefined：排队追加（默认行为，turn 结束后才会被消费）。
    */
   interrupt?: boolean
+  /** 用户通过 /skill:xxx 引用的 Skill slug 列表 */
+  mentionedSkills?: string[]
+  /** 用户通过 #mcp:xxx 引用的 MCP 服务器名称列表 */
+  mentionedMcpServers?: string[]
+  /** 用户通过 &session:xxx 引用的 Agent 会话 ID 列表 */
+  mentionedSessionIds?: string[]
 }
 
 // ===== 会话迁移输入 =====
@@ -1063,6 +1080,8 @@ export interface AgentStreamCompletePayload {
   startedAt?: number
   /** SDK result 消息的 subtype（success / error_max_turns / error_max_budget_usd / error_during_execution 等） */
   resultSubtype?: string
+  /** SDK result 消息携带的错误详情（error_during_execution 等场景下的真实错误原因，用于展示具体错误） */
+  resultErrors?: string[]
   /** 本轮主体结束但仍有后台任务/定时任务在飞行：UI 进入"空闲可输入"态，等待任务完成自动唤醒 */
   backgroundTasksPending?: boolean
 }
@@ -1255,7 +1274,7 @@ export interface ExitPlanModeRequest {
 }
 
 /** ExitPlanMode 用户选择行为 */
-export type ExitPlanModeAction = 'approve_auto' | 'approve_edit' | 'deny' | 'feedback'
+export type ExitPlanModeAction = 'approve_bypass' | 'deny' | 'feedback'
 
 /** ExitPlanMode 响应（渲染进程 → 主进程） */
 export interface ExitPlanModeResponse {
@@ -1270,7 +1289,7 @@ export interface ExitPlanModeResponse {
 // ===== 权限系统类型 =====
 
 /** 当前 Proma 支持的权限模式，值直接映射 SDK 原生 permissionMode */
-export const PROMA_PERMISSION_MODES = ['auto', 'bypassPermissions', 'plan'] as const
+export const PROMA_PERMISSION_MODES = ['bypassPermissions', 'plan'] as const
 
 export type PromaPermissionMode = typeof PROMA_PERMISSION_MODES[number]
 
@@ -1285,11 +1304,6 @@ export interface PromaPermissionModeConfig {
 
 /** Proma 权限模式的单一配置来源 */
 export const PROMA_PERMISSION_MODE_CONFIG = {
-  auto: {
-    sdkMode: 'auto',
-    label: '自动审批',
-    description: 'SDK 内置审批器自动判断，危险操作才需确认',
-  },
   bypassPermissions: {
     sdkMode: 'bypassPermissions',
     label: '完全自动',
@@ -1309,7 +1323,7 @@ export function isPromaPermissionMode(mode: string): mode is PromaPermissionMode
   return (PROMA_PERMISSION_MODES as readonly string[]).includes(mode)
 }
 
-/** 规范化权限模式：不匹配当前三种模式时统一回到默认自动审批 */
+/** 规范化权限模式：历史 auto 或其它非法值统一回到默认完全自动模式 */
 export function migratePermissionMode(mode: string): PromaPermissionMode {
   if (isPromaPermissionMode(mode)) return mode
   return PROMA_DEFAULT_PERMISSION_MODE
@@ -1465,6 +1479,18 @@ export const AGENT_IPC_CHANNELS = {
   DELETE_SKILL_ENTRY: 'agent:delete-skill-entry',
   /** 重命名/移动 Skill 目录下的文件或目录 */
   RENAME_SKILL_ENTRY: 'agent:rename-skill-entry',
+  /** 获取工作区记忆摘要 */
+  GET_WORKSPACE_MEMORY_SUMMARY: 'agent:get-workspace-memory-summary',
+  /** 读取工作区 CLAUDE.md */
+  READ_WORKSPACE_CLAUDE_MD: 'agent:read-workspace-claude-md',
+  /** 写入工作区 CLAUDE.md */
+  WRITE_WORKSPACE_CLAUDE_MD: 'agent:write-workspace-claude-md',
+  /** 列出工作区 auto memory 文件树 */
+  LIST_WORKSPACE_AUTO_MEMORY_FILES: 'agent:list-workspace-auto-memory-files',
+  /** 读取工作区 auto memory 文件 */
+  READ_WORKSPACE_AUTO_MEMORY_FILE: 'agent:read-workspace-auto-memory-file',
+  /** 写入工作区 auto memory 文件 */
+  WRITE_WORKSPACE_AUTO_MEMORY_FILE: 'agent:write-workspace-auto-memory-file',
 
   // 流式事件（主进程 → 渲染进程推送）
   /** Agent 流式事件 */

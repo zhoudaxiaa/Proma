@@ -17,6 +17,10 @@ export {
 } from './context-window'
 export { calculateContextUsageRatio } from './context-usage'
 export {
+  inferMcpTransportType,
+  normalizeMcpTransportType,
+} from './mcp-transport'
+export {
   THINKING_SIGNATURE_ERROR_CODE,
   THINKING_SIGNATURE_ERROR_TITLE,
   THINKING_SIGNATURE_ERROR_MESSAGE,
@@ -25,3 +29,8 @@ export {
   normalizeThinkingSignatureError,
 } from './thinking-signature-error'
 export { normalizePathForCompare } from './normalize-path'
+export {
+  getSDKCompactStatus,
+  isPersistableSDKSystemMessage,
+  type SDKCompactStatus,
+} from './agent-system-message'
